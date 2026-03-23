@@ -755,6 +755,26 @@ struct BenchPathReport {
     median_ms: f64,
     fps: f64,
     detection_count: usize,
+    stages: BenchStageBreakdownReport,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchStageReport {
+    mean_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
+    median_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchStageBreakdownReport {
+    upload: Option<BenchStageReport>,
+    backbone: BenchStageReport,
+    pafpn: BenchStageReport,
+    head: BenchStageReport,
+    decode: BenchStageReport,
+    readback: Option<BenchStageReport>,
+    nms: BenchStageReport,
 }
 
 #[derive(Debug, Serialize)]
@@ -965,6 +985,57 @@ fn run_cpu_detect_demo(
     Ok((decoded, detections))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CpuDetectStageDurations {
+    backbone: Duration,
+    pafpn: Duration,
+    head: Duration,
+    decode: Duration,
+    nms: Duration,
+}
+
+fn run_cpu_detect_demo_profiled(
+    input: &[f32],
+    input_shape: TensorShape,
+    backbone: &CspDarknetDemo,
+    pafpn: &YoloxPafpnDemo,
+    head: &YoloxHeadDemo,
+    decode: &YoloxDecodeDemo,
+    postprocess: &YoloxPostprocessDemo,
+) -> Result<(DecodedPredictions, Vec<Detection>, CpuDetectStageDurations)> {
+    let started = Instant::now();
+    let backbone_cpu = backbone.forward_cpu(input, input_shape)?;
+    let backbone_time = started.elapsed();
+
+    let started = Instant::now();
+    let pafpn_cpu = pafpn.forward_cpu(&backbone_cpu)?;
+    let pafpn_time = started.elapsed();
+
+    let started = Instant::now();
+    let head_cpu = head.forward_cpu(&pafpn_cpu)?;
+    let head_time = started.elapsed();
+
+    let started = Instant::now();
+    let decoded = decode.forward_cpu(&head_cpu)?;
+    let decode_time = started.elapsed();
+
+    let started = Instant::now();
+    let detections = postprocess.forward_cpu(&decoded)?;
+    let nms_time = started.elapsed();
+
+    Ok((
+        decoded,
+        detections,
+        CpuDetectStageDurations {
+            backbone: backbone_time,
+            pafpn: pafpn_time,
+            head: head_time,
+            decode: decode_time,
+            nms: nms_time,
+        },
+    ))
+}
+
 fn print_detections(
     label: &str,
     input_shape: TensorShape,
@@ -1163,12 +1234,49 @@ fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+fn summarize_stage_samples(samples: &[Duration]) -> Result<BenchStageReport> {
+    if samples.is_empty() {
+        bail!("benchmark por etapa sem amostras");
+    }
+
+    let mut ms = samples.iter().map(|item| duration_ms(*item)).collect::<Vec<_>>();
+    ms.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal));
+
+    let total_ms = ms.iter().sum::<f64>();
+    let mean_ms = total_ms / ms.len() as f64;
+    let median_ms = if ms.len().is_multiple_of(2) {
+        let rhs = ms.len() / 2;
+        let lhs = rhs - 1;
+        (ms[lhs] + ms[rhs]) * 0.5
+    } else {
+        ms[ms.len() / 2]
+    };
+
+    Ok(BenchStageReport {
+        mean_ms,
+        min_ms: *ms.first().unwrap_or(&0.0),
+        max_ms: *ms.last().unwrap_or(&0.0),
+        median_ms,
+    })
+}
+
+fn single_stage_report(duration: Duration) -> BenchStageReport {
+    let ms = duration_ms(duration);
+    BenchStageReport {
+        mean_ms: ms,
+        min_ms: ms,
+        max_ms: ms,
+        median_ms: ms,
+    }
+}
+
 fn summarize_bench_samples(
     label: &str,
     samples: &[Duration],
     warmup_iterations: usize,
     detection_count: usize,
     resident_weights: bool,
+    stages: BenchStageBreakdownReport,
 ) -> Result<BenchPathReport> {
     if samples.is_empty() {
         bail!("benchmark `{label}` sem amostras");
@@ -1198,7 +1306,34 @@ fn summarize_bench_samples(
         median_ms,
         fps: if mean_ms > 0.0 { 1000.0 / mean_ms } else { 0.0 },
         detection_count,
+        stages,
     })
+}
+
+fn print_stage_breakdown(label: &str, stages: &BenchStageBreakdownReport) {
+    if let Some(upload) = &stages.upload {
+        println!(
+            "{} stages: upload={:.3}ms backbone={:.3}ms pafpn={:.3}ms head={:.3}ms decode={:.3}ms readback={:.3}ms nms={:.3}ms",
+            label,
+            upload.mean_ms,
+            stages.backbone.mean_ms,
+            stages.pafpn.mean_ms,
+            stages.head.mean_ms,
+            stages.decode.mean_ms,
+            stages.readback.as_ref().map(|item| item.mean_ms).unwrap_or(0.0),
+            stages.nms.mean_ms,
+        );
+    } else {
+        println!(
+            "{} stages: backbone={:.3}ms pafpn={:.3}ms head={:.3}ms decode={:.3}ms nms={:.3}ms",
+            label,
+            stages.backbone.mean_ms,
+            stages.pafpn.mean_ms,
+            stages.head.mean_ms,
+            stages.decode.mean_ms,
+            stages.nms.mean_ms,
+        );
+    }
 }
 
 fn bench_inference_path(
@@ -1217,6 +1352,13 @@ fn bench_inference_path(
 ) -> Result<BenchPathReport> {
     let mut last_detection_count = 0usize;
     let mut samples = Vec::with_capacity(iterations);
+    let mut upload_samples = Vec::with_capacity(iterations);
+    let mut backbone_samples = Vec::with_capacity(iterations);
+    let mut pafpn_samples = Vec::with_capacity(iterations);
+    let mut head_samples = Vec::with_capacity(iterations);
+    let mut decode_samples = Vec::with_capacity(iterations);
+    let mut readback_samples = Vec::with_capacity(iterations);
+    let mut nms_samples = Vec::with_capacity(iterations);
     let (decode, postprocess) = make_bundle_postprocess(
         bundle,
         confidence_threshold,
@@ -1226,7 +1368,7 @@ fn bench_inference_path(
 
     if cpu_only {
         for _ in 0..warmup_iterations {
-            let (_, detections) = run_cpu_detect_demo(
+            let (_, detections, _) = run_cpu_detect_demo_profiled(
                 input,
                 input_shape,
                 &bundle.backbone,
@@ -1239,8 +1381,7 @@ fn bench_inference_path(
         }
 
         for _ in 0..iterations {
-            let started = Instant::now();
-            let (_, detections) = run_cpu_detect_demo(
+            let (decoded, detections, stage_timings) = run_cpu_detect_demo_profiled(
                 input,
                 input_shape,
                 &bundle.backbone,
@@ -1249,8 +1390,19 @@ fn bench_inference_path(
                 &decode,
                 &postprocess,
             )?;
-            samples.push(started.elapsed());
+            let total = stage_timings.backbone
+                + stage_timings.pafpn
+                + stage_timings.head
+                + stage_timings.decode
+                + stage_timings.nms;
+            samples.push(total);
+            backbone_samples.push(stage_timings.backbone);
+            pafpn_samples.push(stage_timings.pafpn);
+            head_samples.push(stage_timings.head);
+            decode_samples.push(stage_timings.decode);
+            nms_samples.push(stage_timings.nms);
             last_detection_count = detections.len();
+            let _ = decoded;
         }
     } else if resident_weights {
         let session = GpuResidentDecodeSession::new(
@@ -1261,23 +1413,38 @@ fn bench_inference_path(
         )?;
 
         for _ in 0..warmup_iterations {
-            let decoded = session.run_decode(input, input_shape, &decode)?;
+            let (decoded, _) = session.run_decode_profiled(input, input_shape, &decode)?;
             let detections = postprocess.forward_cpu(&decoded)?;
             last_detection_count = detections.len();
         }
 
         for _ in 0..iterations {
+            let (decoded, stage_timings) = session.run_decode_profiled(input, input_shape, &decode)?;
             let started = Instant::now();
-            let decoded = session.run_decode(input, input_shape, &decode)?;
             let detections = postprocess.forward_cpu(&decoded)?;
-            samples.push(started.elapsed());
+            let nms_time = started.elapsed();
+            let total = stage_timings.upload
+                + stage_timings.backbone
+                + stage_timings.pafpn
+                + stage_timings.head
+                + stage_timings.decode
+                + stage_timings.readback
+                + nms_time;
+            samples.push(total);
+            upload_samples.push(stage_timings.upload);
+            backbone_samples.push(stage_timings.backbone);
+            pafpn_samples.push(stage_timings.pafpn);
+            head_samples.push(stage_timings.head);
+            decode_samples.push(stage_timings.decode);
+            readback_samples.push(stage_timings.readback);
+            nms_samples.push(nms_time);
             last_detection_count = detections.len();
         }
     } else {
         let session = GpuDecodeSession::new(device_index)?;
 
         for _ in 0..warmup_iterations {
-            let decoded = session.run_decode(
+            let (decoded, _) = session.run_decode_profiled(
                 input,
                 input_shape,
                 &bundle.backbone,
@@ -1290,8 +1457,7 @@ fn bench_inference_path(
         }
 
         for _ in 0..iterations {
-            let started = Instant::now();
-            let decoded = session.run_decode(
+            let (decoded, stage_timings) = session.run_decode_profiled(
                 input,
                 input_shape,
                 &bundle.backbone,
@@ -1299,11 +1465,83 @@ fn bench_inference_path(
                 &bundle.head,
                 &decode,
             )?;
+            let started = Instant::now();
             let detections = postprocess.forward_cpu(&decoded)?;
-            samples.push(started.elapsed());
+            let nms_time = started.elapsed();
+            let total = stage_timings.upload
+                + stage_timings.backbone
+                + stage_timings.pafpn
+                + stage_timings.head
+                + stage_timings.decode
+                + stage_timings.readback
+                + nms_time;
+            samples.push(total);
+            upload_samples.push(stage_timings.upload);
+            backbone_samples.push(stage_timings.backbone);
+            pafpn_samples.push(stage_timings.pafpn);
+            head_samples.push(stage_timings.head);
+            decode_samples.push(stage_timings.decode);
+            readback_samples.push(stage_timings.readback);
+            nms_samples.push(nms_time);
             last_detection_count = detections.len();
         }
     }
+
+    let stages = if cpu_only {
+        BenchStageBreakdownReport {
+            upload: None,
+            backbone: summarize_stage_samples(&backbone_samples)?,
+            pafpn: summarize_stage_samples(&pafpn_samples)?,
+            head: summarize_stage_samples(&head_samples)?,
+            decode: summarize_stage_samples(&decode_samples)?,
+            readback: None,
+            nms: summarize_stage_samples(&nms_samples)?,
+        }
+    } else if resident_weights {
+        let session = GpuResidentDecodeSession::new(
+            &bundle.backbone,
+            &bundle.pafpn,
+            &bundle.head,
+            device_index,
+        )?;
+        let (decoded, sync_stage_timings) = session.run_decode_profiled_sync(input, input_shape, &decode)?;
+        let started = Instant::now();
+        let _detections = postprocess.forward_cpu(&decoded)?;
+        let sync_nms = started.elapsed();
+
+        BenchStageBreakdownReport {
+            upload: Some(single_stage_report(sync_stage_timings.upload)),
+            backbone: single_stage_report(sync_stage_timings.backbone),
+            pafpn: single_stage_report(sync_stage_timings.pafpn),
+            head: single_stage_report(sync_stage_timings.head),
+            decode: single_stage_report(sync_stage_timings.decode),
+            readback: Some(single_stage_report(sync_stage_timings.readback)),
+            nms: single_stage_report(sync_nms),
+        }
+    } else {
+        let session = GpuDecodeSession::new(device_index)?;
+        let (decoded, sync_stage_timings) = session.run_decode_profiled_sync(
+            input,
+            input_shape,
+            &bundle.backbone,
+            &bundle.pafpn,
+            &bundle.head,
+            &decode,
+        )?;
+        let started = Instant::now();
+        let _detections = postprocess.forward_cpu(&decoded)?;
+        let sync_nms = started.elapsed();
+
+        BenchStageBreakdownReport {
+            upload: Some(single_stage_report(sync_stage_timings.upload)),
+            backbone: single_stage_report(sync_stage_timings.backbone),
+            pafpn: single_stage_report(sync_stage_timings.pafpn),
+            head: single_stage_report(sync_stage_timings.head),
+            decode: single_stage_report(sync_stage_timings.decode),
+            readback: Some(single_stage_report(sync_stage_timings.readback)),
+            nms: single_stage_report(sync_nms),
+        }
+    };
 
     summarize_bench_samples(
         label,
@@ -1311,6 +1549,7 @@ fn bench_inference_path(
         warmup_iterations,
         last_detection_count,
         resident_weights,
+        stages,
     )
 }
 
@@ -2740,6 +2979,7 @@ fn bench_infer_bundle(args: BenchInferBundleArgs) -> Result<()> {
             report.fps,
             report.detection_count,
         );
+        print_stage_breakdown(&report.label, &report.stages);
     }
 
     if let Some(report) = &gpu {
@@ -2753,6 +2993,7 @@ fn bench_infer_bundle(args: BenchInferBundleArgs) -> Result<()> {
             report.fps,
             report.detection_count,
         );
+        print_stage_breakdown(&report.label, &report.stages);
     }
 
     if let (Some(cpu), Some(gpu)) = (&cpu, &gpu) {

@@ -7,6 +7,7 @@ use naga::{
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use vulkano::{
     Version, VulkanLibrary,
@@ -1174,31 +1175,140 @@ impl GpuDecodeSession {
         head: &YoloxHeadDemo,
         decode: &YoloxDecodeDemo,
     ) -> Result<DecodedPredictions> {
+        let (decoded, _) =
+            self.run_decode_profiled(input, input_shape, backbone, pafpn, head, decode)?;
+        Ok(decoded)
+    }
+
+    pub fn run_decode_profiled(
+        &self,
+        input: &[f32],
+        input_shape: TensorShape,
+        backbone: &CspDarknetDemo,
+        pafpn: &YoloxPafpnDemo,
+        head: &YoloxHeadDemo,
+        decode: &YoloxDecodeDemo,
+    ) -> Result<(DecodedPredictions, GpuDecodeStageDurations)> {
+        let started = std::time::Instant::now();
         let input = self.runtime.upload_tensor(input, input_shape)?;
+        let upload = started.elapsed();
+
+        let started = std::time::Instant::now();
         let backbone_outputs = self.runtime.run_backbone(&input, backbone)?;
+        let backbone_time = started.elapsed();
         self.runtime.recycle_tensor(input)?;
+
+        let started = std::time::Instant::now();
         let pafpn_outputs = self.runtime.run_pafpn(&backbone_outputs, pafpn)?;
+        let pafpn_time = started.elapsed();
         self.runtime.recycle_tensor(backbone_outputs.f1)?;
         self.runtime.recycle_tensor(backbone_outputs.f2)?;
         self.runtime.recycle_tensor(backbone_outputs.f3)?;
+
+        let started = std::time::Instant::now();
         let head_outputs = self.runtime.run_head(&pafpn_outputs, head)?;
+        let head_time = started.elapsed();
         self.runtime.recycle_tensor(pafpn_outputs.p3)?;
         self.runtime.recycle_tensor(pafpn_outputs.p4)?;
         self.runtime.recycle_tensor(pafpn_outputs.p5)?;
+
+        let started = std::time::Instant::now();
         let decoded = self.runtime.run_decode(&head_outputs, decode)?;
+        let decode_time = started.elapsed();
         self.runtime.recycle_tensor(head_outputs.s8)?;
         self.runtime.recycle_tensor(head_outputs.s16)?;
         self.runtime.recycle_tensor(head_outputs.s32)?;
+
         let rows = decoded.rows;
         let cols = decoded.cols;
+        let started = std::time::Instant::now();
         let data = self.runtime.read_matrix(&decoded)?;
+        let readback = started.elapsed();
         self.runtime.recycle_matrix(decoded)?;
 
-        Ok(DecodedPredictions {
-            rows,
-            cols,
-            data,
-        })
+        Ok((
+            DecodedPredictions {
+                rows,
+                cols,
+                data,
+            },
+            GpuDecodeStageDurations {
+                upload,
+                backbone: backbone_time,
+                pafpn: pafpn_time,
+                head: head_time,
+                decode: decode_time,
+                readback,
+            },
+        ))
+    }
+
+    pub fn run_decode_profiled_sync(
+        &self,
+        input: &[f32],
+        input_shape: TensorShape,
+        backbone: &CspDarknetDemo,
+        pafpn: &YoloxPafpnDemo,
+        head: &YoloxHeadDemo,
+        decode: &YoloxDecodeDemo,
+    ) -> Result<(DecodedPredictions, GpuDecodeStageDurations)> {
+        let started = std::time::Instant::now();
+        let input = self.runtime.upload_tensor(input, input_shape)?;
+        self.runtime.finish_pending_work()?;
+        let upload = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let backbone_outputs = self.runtime.run_backbone(&input, backbone)?;
+        self.runtime.finish_pending_work()?;
+        let backbone_time = started.elapsed();
+        self.runtime.recycle_tensor(input)?;
+
+        let started = std::time::Instant::now();
+        let pafpn_outputs = self.runtime.run_pafpn(&backbone_outputs, pafpn)?;
+        self.runtime.finish_pending_work()?;
+        let pafpn_time = started.elapsed();
+        self.runtime.recycle_tensor(backbone_outputs.f1)?;
+        self.runtime.recycle_tensor(backbone_outputs.f2)?;
+        self.runtime.recycle_tensor(backbone_outputs.f3)?;
+
+        let started = std::time::Instant::now();
+        let head_outputs = self.runtime.run_head(&pafpn_outputs, head)?;
+        self.runtime.finish_pending_work()?;
+        let head_time = started.elapsed();
+        self.runtime.recycle_tensor(pafpn_outputs.p3)?;
+        self.runtime.recycle_tensor(pafpn_outputs.p4)?;
+        self.runtime.recycle_tensor(pafpn_outputs.p5)?;
+
+        let started = std::time::Instant::now();
+        let decoded = self.runtime.run_decode(&head_outputs, decode)?;
+        self.runtime.finish_pending_work()?;
+        let decode_time = started.elapsed();
+        self.runtime.recycle_tensor(head_outputs.s8)?;
+        self.runtime.recycle_tensor(head_outputs.s16)?;
+        self.runtime.recycle_tensor(head_outputs.s32)?;
+
+        let rows = decoded.rows;
+        let cols = decoded.cols;
+        let started = std::time::Instant::now();
+        let data = self.runtime.read_matrix(&decoded)?;
+        let readback = started.elapsed();
+        self.runtime.recycle_matrix(decoded)?;
+
+        Ok((
+            DecodedPredictions {
+                rows,
+                cols,
+                data,
+            },
+            GpuDecodeStageDurations {
+                upload,
+                backbone: backbone_time,
+                pafpn: pafpn_time,
+                head: head_time,
+                decode: decode_time,
+                readback,
+            },
+        ))
     }
 }
 
@@ -1224,33 +1334,137 @@ impl GpuResidentDecodeSession {
         input_shape: TensorShape,
         decode: &YoloxDecodeDemo,
     ) -> Result<DecodedPredictions> {
+        let (decoded, _) = self.run_decode_profiled(input, input_shape, decode)?;
+        Ok(decoded)
+    }
+
+    pub fn run_decode_profiled(
+        &self,
+        input: &[f32],
+        input_shape: TensorShape,
+        decode: &YoloxDecodeDemo,
+    ) -> Result<(DecodedPredictions, GpuDecodeStageDurations)> {
+        let started = std::time::Instant::now();
         let input = self.runtime.upload_tensor(input, input_shape)?;
+        let upload = started.elapsed();
+
+        let started = std::time::Instant::now();
         let backbone_outputs = self.runtime.run_backbone_prepared(&input, &self.backbone)?;
+        let backbone_time = started.elapsed();
         self.runtime.recycle_tensor(input)?;
+
+        let started = std::time::Instant::now();
         let pafpn_outputs = self
             .runtime
             .run_pafpn_prepared(&backbone_outputs, &self.pafpn)?;
+        let pafpn_time = started.elapsed();
         self.runtime.recycle_tensor(backbone_outputs.f1)?;
         self.runtime.recycle_tensor(backbone_outputs.f2)?;
         self.runtime.recycle_tensor(backbone_outputs.f3)?;
+
+        let started = std::time::Instant::now();
         let head_outputs = self.runtime.run_head_prepared(&pafpn_outputs, &self.head)?;
+        let head_time = started.elapsed();
         self.runtime.recycle_tensor(pafpn_outputs.p3)?;
         self.runtime.recycle_tensor(pafpn_outputs.p4)?;
         self.runtime.recycle_tensor(pafpn_outputs.p5)?;
+
+        let started = std::time::Instant::now();
         let decoded = self.runtime.run_decode(&head_outputs, decode)?;
+        let decode_time = started.elapsed();
         self.runtime.recycle_tensor(head_outputs.s8)?;
         self.runtime.recycle_tensor(head_outputs.s16)?;
         self.runtime.recycle_tensor(head_outputs.s32)?;
+
         let rows = decoded.rows;
         let cols = decoded.cols;
+        let started = std::time::Instant::now();
         let data = self.runtime.read_matrix(&decoded)?;
+        let readback = started.elapsed();
         self.runtime.recycle_matrix(decoded)?;
 
-        Ok(DecodedPredictions {
-            rows,
-            cols,
-            data,
-        })
+        Ok((
+            DecodedPredictions {
+                rows,
+                cols,
+                data,
+            },
+            GpuDecodeStageDurations {
+                upload,
+                backbone: backbone_time,
+                pafpn: pafpn_time,
+                head: head_time,
+                decode: decode_time,
+                readback,
+            },
+        ))
+    }
+
+    pub fn run_decode_profiled_sync(
+        &self,
+        input: &[f32],
+        input_shape: TensorShape,
+        decode: &YoloxDecodeDemo,
+    ) -> Result<(DecodedPredictions, GpuDecodeStageDurations)> {
+        let started = std::time::Instant::now();
+        let input = self.runtime.upload_tensor(input, input_shape)?;
+        self.runtime.finish_pending_work()?;
+        let upload = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let backbone_outputs = self.runtime.run_backbone_prepared(&input, &self.backbone)?;
+        self.runtime.finish_pending_work()?;
+        let backbone_time = started.elapsed();
+        self.runtime.recycle_tensor(input)?;
+
+        let started = std::time::Instant::now();
+        let pafpn_outputs = self
+            .runtime
+            .run_pafpn_prepared(&backbone_outputs, &self.pafpn)?;
+        self.runtime.finish_pending_work()?;
+        let pafpn_time = started.elapsed();
+        self.runtime.recycle_tensor(backbone_outputs.f1)?;
+        self.runtime.recycle_tensor(backbone_outputs.f2)?;
+        self.runtime.recycle_tensor(backbone_outputs.f3)?;
+
+        let started = std::time::Instant::now();
+        let head_outputs = self.runtime.run_head_prepared(&pafpn_outputs, &self.head)?;
+        self.runtime.finish_pending_work()?;
+        let head_time = started.elapsed();
+        self.runtime.recycle_tensor(pafpn_outputs.p3)?;
+        self.runtime.recycle_tensor(pafpn_outputs.p4)?;
+        self.runtime.recycle_tensor(pafpn_outputs.p5)?;
+
+        let started = std::time::Instant::now();
+        let decoded = self.runtime.run_decode(&head_outputs, decode)?;
+        self.runtime.finish_pending_work()?;
+        let decode_time = started.elapsed();
+        self.runtime.recycle_tensor(head_outputs.s8)?;
+        self.runtime.recycle_tensor(head_outputs.s16)?;
+        self.runtime.recycle_tensor(head_outputs.s32)?;
+
+        let rows = decoded.rows;
+        let cols = decoded.cols;
+        let started = std::time::Instant::now();
+        let data = self.runtime.read_matrix(&decoded)?;
+        let readback = started.elapsed();
+        self.runtime.recycle_matrix(decoded)?;
+
+        Ok((
+            DecodedPredictions {
+                rows,
+                cols,
+                data,
+            },
+            GpuDecodeStageDurations {
+                upload,
+                backbone: backbone_time,
+                pafpn: pafpn_time,
+                head: head_time,
+                decode: decode_time,
+                readback,
+            },
+        ))
     }
 }
 
@@ -1399,6 +1613,16 @@ pub struct VulkanDeviceInfo {
     pub driver_name: Option<String>,
     pub driver_info: Option<String>,
     pub driver_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GpuDecodeStageDurations {
+    pub upload: Duration,
+    pub backbone: Duration,
+    pub pafpn: Duration,
+    pub head: Duration,
+    pub decode: Duration,
+    pub readback: Duration,
 }
 
 struct VulkanRuntime {
@@ -3289,6 +3513,22 @@ impl VulkanRuntime {
 
     fn reset_submission_future(&self) -> Result<()> {
         self.store_submission_future(vk_sync::now(self.device.clone()).boxed())
+    }
+
+    fn finish_pending_work(&self) -> Result<()> {
+        let future = self.take_submission_future()?;
+        if future.queue().is_none() {
+            self.reset_submission_future()?;
+            return Ok(());
+        }
+
+        let mut future = future
+            .then_signal_fence_and_flush()
+            .context("falha ao flushar submissões pendentes")?;
+        let result = future.wait(None).context("falha ao aguardar submissões pendentes");
+        future.cleanup_finished();
+        self.reset_submission_future()?;
+        result
     }
 
     fn execute_compute(
