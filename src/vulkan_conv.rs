@@ -3345,20 +3345,35 @@ impl VulkanRuntime {
         len: usize,
         usage: BufferUsage,
     ) -> Result<Subbuffer<[T]>> {
-        Buffer::new_slice::<T>(
-            self.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                ..Default::default()
-            },
-            len as u64,
-        )
-        .context("falha ao criar buffer de readback")
+        let buffer_info = BufferCreateInfo {
+            usage,
+            ..Default::default()
+        };
+        let filters = [
+            MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            MemoryTypeFilter::PREFER_HOST,
+            MemoryTypeFilter::empty(),
+        ];
+        let mut last_error = None;
+
+        for memory_type_filter in filters {
+            match Buffer::new_slice::<T>(
+                self.memory_allocator.clone(),
+                buffer_info.clone(),
+                AllocationCreateInfo {
+                    memory_type_filter,
+                    ..Default::default()
+                },
+                len as u64,
+            ) {
+                Ok(buffer) => return Ok(buffer),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap())
+            .context("falha ao criar buffer de readback")
     }
 
     fn upload_host_storage_buffer<
