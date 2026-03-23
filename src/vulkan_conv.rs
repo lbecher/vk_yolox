@@ -1254,6 +1254,45 @@ impl GpuResidentDecodeSession {
     }
 }
 
+pub fn query_vulkan_device_info(device_index: usize) -> Result<VulkanDeviceInfo> {
+    let library = load_vulkan_library()?;
+    let instance = Instance::new(
+        library,
+        InstanceCreateInfo {
+            flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+            max_api_version: Some(Version::V1_0),
+            enabled_extensions: InstanceExtensions {
+                khr_get_physical_device_properties2: true,
+                ..InstanceExtensions::empty()
+            },
+            ..Default::default()
+        },
+    )
+    .context("falha ao criar instância Vulkan para coletar metadados")?;
+
+    let physical_devices = instance
+        .enumerate_physical_devices()
+        .context("falha ao enumerar GPUs Vulkan para coletar metadados")?
+        .collect::<Vec<_>>();
+    let physical_device = physical_devices
+        .get(device_index)
+        .cloned()
+        .ok_or_else(|| anyhow!("device_index {} inválido", device_index))?;
+    let properties = physical_device.properties();
+
+    Ok(VulkanDeviceInfo {
+        device_name: properties.device_name.clone(),
+        device_type: format!("{:?}", properties.device_type),
+        vendor_id: properties.vendor_id,
+        device_id: properties.device_id,
+        api_version: properties.api_version.to_string(),
+        driver_version: properties.driver_version,
+        driver_name: properties.driver_name.clone(),
+        driver_info: properties.driver_info.clone(),
+        driver_id: properties.driver_id.map(|item| format!("{item:?}")),
+    })
+}
+
 struct PreparedBaseConvBlock {
     conv: GpuFusedConv2dWeights,
 }
@@ -1347,6 +1386,19 @@ pub struct GpuResidentDecodeSession {
     backbone: PreparedBackbone,
     pafpn: PreparedPafpn,
     head: PreparedHead,
+}
+
+#[derive(Debug, Clone)]
+pub struct VulkanDeviceInfo {
+    pub device_name: String,
+    pub device_type: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub api_version: String,
+    pub driver_version: u32,
+    pub driver_name: Option<String>,
+    pub driver_info: Option<String>,
+    pub driver_id: Option<String>,
 }
 
 struct VulkanRuntime {

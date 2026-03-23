@@ -13,8 +13,10 @@ use model_bundle::{BundleRawWeightPatch, DemoModelBundle};
 use model_plan::{ModelPlan, ModelVariant, build_model_plan, bytes_to_mib};
 use serde::Serialize;
 use std::{
+    env,
     fs,
     path::PathBuf,
+    process::Command as ProcessCommand,
     time::{Duration, Instant},
 };
 use tensor_ops::{
@@ -22,9 +24,9 @@ use tensor_ops::{
     maxpool2d_nchw, sigmoid_nchw, silu_nchw, upsample_nearest_nchw,
 };
 use vulkan_conv::{
-    GpuDecodeSession, GpuResidentDecodeSession, run_conv2d_demo, run_demo_backbone,
-    run_demo_block, run_demo_bottleneck, run_demo_csp, run_demo_dark5, run_demo_decode,
-    run_demo_decode_resident, run_demo_head, run_demo_pafpn, run_demo_stem,
+    GpuDecodeSession, GpuResidentDecodeSession, query_vulkan_device_info, run_conv2d_demo,
+    run_demo_backbone, run_demo_block, run_demo_bottleneck, run_demo_csp, run_demo_dark5,
+    run_demo_decode, run_demo_decode_resident, run_demo_head, run_demo_pafpn, run_demo_stem,
 };
 use yolox_blocks::{
     BottleneckBlock, CspDarknetDemo, CspStageBlock, Dark5Block, DecodedPredictions, Detection,
@@ -675,7 +677,42 @@ struct InferenceReport {
     input_w: usize,
     cpu_only: bool,
     resident_weights: bool,
+    environment: RuntimeEnvironmentReport,
     detections: Vec<SerializableDetection>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeEnvironmentReport {
+    system: SystemInfoReport,
+    gpu: Option<GpuInfoReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemInfoReport {
+    os: String,
+    arch: String,
+    family: String,
+    kernel: Option<String>,
+    android_release: Option<String>,
+    android_sdk: Option<String>,
+    android_build_fingerprint: Option<String>,
+    device_manufacturer: Option<String>,
+    device_model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GpuInfoReport {
+    backend: String,
+    device_index: usize,
+    device_name: String,
+    device_type: String,
+    vendor_id: u32,
+    device_id: u32,
+    api_version: String,
+    driver_version: u32,
+    driver_name: Option<String>,
+    driver_info: Option<String>,
+    driver_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -696,6 +733,7 @@ struct CompareInferenceReport {
     input_h: usize,
     input_w: usize,
     resident_weights: bool,
+    environment: RuntimeEnvironmentReport,
     decoded_elements: usize,
     decoded_max_abs_diff: f32,
     decoded_mean_abs_diff: f64,
@@ -726,8 +764,92 @@ struct BenchInferenceReport {
     input_w: usize,
     bundle_load_ms: f64,
     input_prepare_ms: f64,
+    environment: RuntimeEnvironmentReport,
     cpu: Option<BenchPathReport>,
     gpu: Option<BenchPathReport>,
+}
+
+fn command_output_trimmed(program: &str, args: &[&str]) -> Option<String> {
+    let output = ProcessCommand::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn collect_system_info() -> SystemInfoReport {
+    let is_android = env::consts::OS == "android";
+    let kernel = if is_android {
+        command_output_trimmed("getprop", &["ro.kernel.version"])
+            .or_else(|| command_output_trimmed("uname", &["-sr"]))
+    } else {
+        command_output_trimmed("uname", &["-sr"])
+    };
+
+    SystemInfoReport {
+        os: env::consts::OS.to_string(),
+        arch: env::consts::ARCH.to_string(),
+        family: env::consts::FAMILY.to_string(),
+        kernel,
+        android_release: if is_android {
+            command_output_trimmed("getprop", &["ro.build.version.release"])
+        } else {
+            None
+        },
+        android_sdk: if is_android {
+            command_output_trimmed("getprop", &["ro.build.version.sdk"])
+        } else {
+            None
+        },
+        android_build_fingerprint: if is_android {
+            command_output_trimmed("getprop", &["ro.build.fingerprint"])
+        } else {
+            None
+        },
+        device_manufacturer: if is_android {
+            command_output_trimmed("getprop", &["ro.product.manufacturer"])
+        } else {
+            None
+        },
+        device_model: if is_android {
+            command_output_trimmed("getprop", &["ro.product.model"])
+        } else {
+            None
+        },
+    }
+}
+
+fn collect_runtime_environment(device_index: usize, include_gpu: bool) -> RuntimeEnvironmentReport {
+    let gpu = if include_gpu {
+        query_vulkan_device_info(device_index)
+            .ok()
+            .map(|info| GpuInfoReport {
+                backend: "vulkan".to_string(),
+                device_index,
+                device_name: info.device_name,
+                device_type: info.device_type,
+                vendor_id: info.vendor_id,
+                device_id: info.device_id,
+                api_version: info.api_version,
+                driver_version: info.driver_version,
+                driver_name: info.driver_name,
+                driver_info: info.driver_info,
+                driver_id: info.driver_id,
+            })
+    } else {
+        None
+    };
+
+    RuntimeEnvironmentReport {
+        system: collect_system_info(),
+        gpu,
+    }
 }
 
 fn main() -> Result<()> {
@@ -2504,6 +2626,7 @@ fn infer_bundle(args: InferBundleArgs) -> Result<()> {
         input_w: args.input_w,
         cpu_only: args.cpu_only,
         resident_weights: args.resident_weights,
+        environment: collect_runtime_environment(args.device_index, !args.cpu_only),
         detections: serializable,
     };
 
@@ -2650,6 +2773,7 @@ fn bench_infer_bundle(args: BenchInferBundleArgs) -> Result<()> {
             input_w: args.input_w,
             bundle_load_ms: duration_ms(bundle_load_elapsed),
             input_prepare_ms: duration_ms(input_prepare_elapsed),
+            environment: collect_runtime_environment(args.device_index, run_gpu),
             cpu,
             gpu,
         };
@@ -2762,6 +2886,7 @@ fn compare_infer_bundle(args: CompareInferBundleArgs) -> Result<()> {
             input_h: args.input_h,
             input_w: args.input_w,
             resident_weights: args.resident_weights,
+            environment: collect_runtime_environment(args.device_index, true),
             decoded_elements: cpu_decoded.data.len(),
             decoded_max_abs_diff: diff.max_abs_diff,
             decoded_mean_abs_diff: diff.mean_abs_diff,
