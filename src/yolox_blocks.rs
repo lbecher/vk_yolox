@@ -504,7 +504,7 @@ pub struct YoloxPafpnDemo {
 
 impl YoloxPafpnDemo {
     pub fn demo(base_channels: usize, base_depth: usize, depthwise: bool) -> Result<Self> {
-        let neck_depth = base_depth * 3;
+        let neck_depth = base_depth;
         let lateral_conv0 = BaseConvBlock::demo(base_channels * 16, base_channels * 8, 1, 1, 0)?;
         let c3_p4 = CspBottleneckBlock::demo(
             base_channels * 16,
@@ -951,8 +951,8 @@ fn decode_head_scale(
                 input[idx]
             };
 
-            output[base] = (sigmoid_scalar(load(0)) + x as f32) * stride as f32;
-            output[base + 1] = (sigmoid_scalar(load(1)) + y as f32) * stride as f32;
+            output[base] = (load(0) + x as f32) * stride as f32;
+            output[base + 1] = (load(1) + y as f32) * stride as f32;
             output[base + 2] = load(2).clamp(-16.0, 16.0).exp() * stride as f32;
             output[base + 3] = load(3).clamp(-16.0, 16.0).exp() * stride as f32;
             output[base + 4] = sigmoid_scalar(load(4));
@@ -999,12 +999,14 @@ fn detection_iou(lhs: &Detection, rhs: &Detection) -> f32 {
     let inter_x1 = lhs.x1.min(rhs.x1);
     let inter_y1 = lhs.y1.min(rhs.y1);
 
-    let inter_w = (inter_x1 - inter_x0).max(0.0);
-    let inter_h = (inter_y1 - inter_y0).max(0.0);
+    // Match the Burn reference NMS exactly. The +1.0 convention affects
+    // whether near-identical boxes get suppressed.
+    let inter_w = (inter_x1 - inter_x0 + 1.0).max(0.0);
+    let inter_h = (inter_y1 - inter_y0 + 1.0).max(0.0);
     let inter_area = inter_w * inter_h;
 
-    let lhs_area = (lhs.x1 - lhs.x0).max(0.0) * (lhs.y1 - lhs.y0).max(0.0);
-    let rhs_area = (rhs.x1 - rhs.x0).max(0.0) * (rhs.y1 - rhs.y0).max(0.0);
+    let lhs_area = (lhs.x1 - lhs.x0 + 1.0).max(0.0) * (lhs.y1 - lhs.y0 + 1.0).max(0.0);
+    let rhs_area = (rhs.x1 - rhs.x0 + 1.0).max(0.0) * (rhs.y1 - rhs.y0 + 1.0).max(0.0);
     let union_area = lhs_area + rhs_area - inter_area;
 
     if union_area <= 0.0 {

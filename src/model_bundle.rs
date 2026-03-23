@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::Path};
 
 use crate::{
-    fused_weights::FusedConv2dWeights,
+    fused_weights::{BatchNorm1d, FusedConv2dWeights, RawConv2dWeights, fuse_conv2d_bn},
     yolox_blocks::{CspDarknetDemo, YoloxHeadDemo, YoloxPafpnDemo},
 };
 
@@ -31,6 +31,24 @@ pub struct NamedConvLayer {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalTensorNames {
+    pub weight: String,
+    pub bias: Option<String>,
+    pub bn_scale: Option<String>,
+    pub bn_bias: Option<String>,
+    pub bn_mean: Option<String>,
+    pub bn_var: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NamedLayerMapping {
+    pub name: String,
+    pub spec: crate::fused_weights::Conv2dSpec,
+    pub source: String,
+    pub external: ExternalTensorNames,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NamedLayerWeights {
     pub name: String,
     pub weights: FusedConv2dWeights,
@@ -40,6 +58,32 @@ pub struct NamedLayerWeights {
 pub struct BundleWeightPatch {
     pub meta: DemoModelBundleMeta,
     pub layers: Vec<NamedLayerWeights>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NamedRawLayerWeights {
+    pub name: String,
+    pub raw: RawConv2dWeights,
+    pub bn: Option<BatchNorm1d>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BundleRawWeightPatch {
+    pub meta: DemoModelBundleMeta,
+    pub layers: Vec<NamedRawLayerWeights>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalTensorFile {
+    pub name: String,
+    pub file: String,
+    pub len: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalTensorManifest {
+    pub source: String,
+    pub tensors: Vec<ExternalTensorFile>,
 }
 
 impl DemoModelBundle {
@@ -325,6 +369,152 @@ impl DemoModelBundle {
             .with_context(|| format!("falha ao escrever manifesto em {}", path.display()))
     }
 
+    pub fn named_layer_mappings_for_burn(&self) -> Result<Vec<NamedLayerMapping>> {
+        self.named_layers()
+            .into_iter()
+            .map(|layer| {
+                let external = burn_external_names(&layer.name)?;
+                Ok(NamedLayerMapping {
+                    name: layer.name,
+                    spec: layer.spec,
+                    source: "yolox-burn".to_string(),
+                    external,
+                })
+            })
+            .collect()
+    }
+
+    pub fn save_burn_mapping_manifest_json(&self, path: &Path) -> Result<()> {
+        let serialized = serde_json::to_string_pretty(&self.named_layer_mappings_for_burn()?)
+            .context("falha ao serializar o manifesto de mapeamento Burn")?;
+        fs::write(path, serialized)
+            .with_context(|| format!("falha ao escrever mapeamento Burn em {}", path.display()))
+    }
+
+    pub fn build_raw_patch_from_external_manifest(
+        &self,
+        manifest_path: &Path,
+    ) -> Result<BundleRawWeightPatch> {
+        let serialized = fs::read_to_string(manifest_path).with_context(|| {
+            format!(
+                "falha ao ler manifesto externo de tensores {}",
+                manifest_path.display()
+            )
+        })?;
+        let manifest: ExternalTensorManifest = serde_json::from_str(&serialized)
+            .context("falha ao desserializar manifesto externo de tensores")?;
+        let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+        self.build_raw_patch_from_external_tensors(base_dir, &manifest)
+    }
+
+    pub fn build_raw_patch_from_external_tensors(
+        &self,
+        base_dir: &Path,
+        manifest: &ExternalTensorManifest,
+    ) -> Result<BundleRawWeightPatch> {
+        let mapping = self.named_layer_mappings_for_burn()?;
+        let tensor_by_name = manifest
+            .tensors
+            .iter()
+            .map(|tensor| (tensor.name.as_str(), tensor))
+            .collect::<HashMap<_, _>>();
+
+        let mut layers = Vec::with_capacity(mapping.len());
+        for layer in mapping {
+            let weight = read_manifest_tensor(
+                base_dir,
+                &tensor_by_name,
+                &layer.external.weight,
+                layer.spec.weight_len(),
+            )
+            .with_context(|| format!("falha ao carregar pesos de `{}`", layer.name))?;
+
+            let bias = match &layer.external.bias {
+                Some(name) => Some(
+                    read_manifest_tensor(base_dir, &tensor_by_name, name, layer.spec.out_channels)
+                        .with_context(|| {
+                            format!("falha ao carregar bias da camada `{}`", layer.name)
+                        })?,
+                ),
+                None => None,
+            };
+
+            let bn = match (
+                &layer.external.bn_scale,
+                &layer.external.bn_bias,
+                &layer.external.bn_mean,
+                &layer.external.bn_var,
+            ) {
+                (Some(scale), Some(bias), Some(mean), Some(var)) => Some(BatchNorm1d {
+                    scale: read_manifest_tensor(
+                        base_dir,
+                        &tensor_by_name,
+                        scale,
+                        layer.spec.out_channels,
+                    )
+                    .with_context(|| {
+                        format!("falha ao carregar bn.scale da camada `{}`", layer.name)
+                    })?,
+                    bias: read_manifest_tensor(
+                        base_dir,
+                        &tensor_by_name,
+                        bias,
+                        layer.spec.out_channels,
+                    )
+                    .with_context(|| {
+                        format!("falha ao carregar bn.bias da camada `{}`", layer.name)
+                    })?,
+                    mean: read_manifest_tensor(
+                        base_dir,
+                        &tensor_by_name,
+                        mean,
+                        layer.spec.out_channels,
+                    )
+                    .with_context(|| {
+                        format!("falha ao carregar bn.mean da camada `{}`", layer.name)
+                    })?,
+                    var: read_manifest_tensor(
+                        base_dir,
+                        &tensor_by_name,
+                        var,
+                        layer.spec.out_channels,
+                    )
+                    .with_context(|| {
+                        format!("falha ao carregar bn.var da camada `{}`", layer.name)
+                    })?,
+                    epsilon: 1e-3,
+                }),
+                (None, None, None, None) => None,
+                _ => bail!(
+                    "mapeamento externo incompleto para `{}`: BatchNorm parcialmente definido",
+                    layer.name
+                ),
+            };
+
+            layers.push(NamedRawLayerWeights {
+                name: layer.name,
+                raw: RawConv2dWeights {
+                    spec: layer.spec,
+                    weights: weight,
+                    bias,
+                },
+                bn,
+            });
+        }
+
+        Ok(BundleRawWeightPatch {
+            meta: self.meta.clone(),
+            layers,
+        })
+    }
+
+    pub fn save_raw_weight_patch_json(&self, patch: &BundleRawWeightPatch, path: &Path) -> Result<()> {
+        let serialized = serde_json::to_string_pretty(patch)
+            .context("falha ao serializar patch raw de pesos")?;
+        fs::write(path, serialized)
+            .with_context(|| format!("falha ao escrever patch raw em {}", path.display()))
+    }
+
     pub fn export_weight_patch(&self) -> BundleWeightPatch {
         let mut layers = Vec::new();
         self.for_each_named_fused_conv(|name, weights| {
@@ -419,6 +609,102 @@ impl DemoModelBundle {
         })?;
 
         self.validate()
+    }
+
+    pub fn apply_raw_weight_patch(&mut self, patch: &BundleRawWeightPatch) -> Result<()> {
+        if patch.meta.num_classes != self.meta.num_classes {
+            bail!(
+                "patch raw incompatível: num_classes={} bundle={}",
+                patch.meta.num_classes,
+                self.meta.num_classes
+            );
+        }
+
+        let mut patch_by_name = patch
+            .layers
+            .iter()
+            .map(|layer| (layer.name.as_str(), layer))
+            .collect::<HashMap<_, _>>();
+        let expected = self.named_layers();
+
+        for layer in &expected {
+            let Some(imported) = patch_by_name.remove(layer.name.as_str()) else {
+                bail!("patch raw incompleto: camada `{}` ausente", layer.name);
+            };
+
+            let spec = imported.raw.spec;
+            if spec.in_channels != layer.spec.in_channels
+                || spec.out_channels != layer.spec.out_channels
+                || spec.groups != layer.spec.groups
+                || spec.kernel_h != layer.spec.kernel_h
+                || spec.kernel_w != layer.spec.kernel_w
+                || spec.stride_h != layer.spec.stride_h
+                || spec.stride_w != layer.spec.stride_w
+                || spec.pad_h != layer.spec.pad_h
+                || spec.pad_w != layer.spec.pad_w
+            {
+                bail!("patch raw incompatível com a camada `{}`", layer.name);
+            }
+
+            let expected_weights = spec.weight_len();
+            if imported.raw.weights.len() != expected_weights {
+                bail!(
+                    "patch raw inválido para `{}`: weights={} esperado={}",
+                    layer.name,
+                    imported.raw.weights.len(),
+                    expected_weights
+                );
+            }
+
+            if let Some(bias) = &imported.raw.bias
+                && bias.len() != spec.out_channels
+            {
+                bail!(
+                    "patch raw inválido para `{}`: bias={} esperado={}",
+                    layer.name,
+                    bias.len(),
+                    spec.out_channels
+                );
+            }
+
+            if let Some(bn) = &imported.bn
+                && (bn.scale.len() != spec.out_channels
+                    || bn.bias.len() != spec.out_channels
+                    || bn.mean.len() != spec.out_channels
+                    || bn.var.len() != spec.out_channels)
+            {
+                bail!("batchnorm incompatível com a camada `{}`", layer.name);
+            }
+        }
+
+        if let Some(extra) = patch_by_name.keys().next() {
+            bail!("patch raw contém camada extra não reconhecida: `{extra}`");
+        }
+
+        let mut owned = patch
+            .layers
+            .iter()
+            .map(|layer| (layer.name.clone(), layer.clone()))
+            .collect::<HashMap<_, _>>();
+
+        self.for_each_named_fused_conv_mut(|name, weights| {
+            let imported = owned
+                .remove(&name)
+                .ok_or_else(|| anyhow::anyhow!("patch raw interno ausente para `{name}`"))?;
+            let bn = imported
+                .bn
+                .unwrap_or_else(|| BatchNorm1d::identity(imported.raw.spec.out_channels));
+            *weights = fuse_conv2d_bn(&imported.raw, &bn)?;
+            Ok(())
+        })?;
+
+        self.validate()
+    }
+
+    pub fn load_raw_weight_patch_json(path: &Path) -> Result<BundleRawWeightPatch> {
+        let serialized = fs::read_to_string(path)
+            .with_context(|| format!("falha ao ler patch raw {}", path.display()))?;
+        serde_json::from_str(&serialized).context("falha ao desserializar patch raw de pesos")
     }
 
     pub fn load_weight_patch_from_directory(&self, dir: &Path) -> Result<BundleWeightPatch> {
@@ -967,4 +1253,267 @@ fn read_f32_bin(path: &Path) -> Result<Vec<f32>> {
         values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     Ok(values)
+}
+
+fn read_manifest_tensor(
+    base_dir: &Path,
+    tensor_by_name: &HashMap<&str, &ExternalTensorFile>,
+    name: &str,
+    expected_len: usize,
+) -> Result<Vec<f32>> {
+    let tensor = tensor_by_name
+        .get(name)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("tensor externo ausente: `{name}`"))?;
+    let path = base_dir.join(&tensor.file);
+    let values = read_f32_bin(&path)?;
+    if values.len() != tensor.len {
+        bail!(
+            "tensor externo `{}` inconsistente: manifesto={} arquivo={}",
+            name,
+            tensor.len,
+            values.len()
+        );
+    }
+    if values.len() != expected_len {
+        bail!(
+            "tensor externo `{}` incompatível: recebido={} esperado={}",
+            name,
+            values.len(),
+            expected_len
+        );
+    }
+    Ok(values)
+}
+
+fn burn_external_names(name: &str) -> Result<ExternalTensorNames> {
+    let make_baseconv = |prefix: String| ExternalTensorNames {
+        weight: format!("{prefix}.conv.weight"),
+        bias: None,
+        bn_scale: Some(format!("{prefix}.bn.gamma")),
+        bn_bias: Some(format!("{prefix}.bn.beta")),
+        bn_mean: Some(format!("{prefix}.bn.running_mean")),
+        bn_var: Some(format!("{prefix}.bn.running_var")),
+    };
+
+    let make_pred = |prefix: String| ExternalTensorNames {
+        weight: format!("{prefix}.weight"),
+        bias: Some(format!("{prefix}.bias")),
+        bn_scale: None,
+        bn_bias: None,
+        bn_mean: None,
+        bn_var: None,
+    };
+
+    let mapped = match name {
+        "backbone.stem.conv" => make_baseconv("backbone.backbone.stem.conv".to_string()),
+
+        "backbone.dark2.conv" => make_baseconv("backbone.backbone.dark2.conv".to_string()),
+        "backbone.dark2.conv.depthwise" => {
+            make_baseconv("backbone.backbone.dark2.conv.dconv".to_string())
+        }
+        "backbone.dark2.conv.pointwise" => {
+            make_baseconv("backbone.backbone.dark2.conv.pconv".to_string())
+        }
+
+        "backbone.dark3.conv" => make_baseconv("backbone.backbone.dark3.conv".to_string()),
+        "backbone.dark3.conv.depthwise" => {
+            make_baseconv("backbone.backbone.dark3.conv.dconv".to_string())
+        }
+        "backbone.dark3.conv.pointwise" => {
+            make_baseconv("backbone.backbone.dark3.conv.pconv".to_string())
+        }
+
+        "backbone.dark4.conv" => make_baseconv("backbone.backbone.dark4.conv".to_string()),
+        "backbone.dark4.conv.depthwise" => {
+            make_baseconv("backbone.backbone.dark4.conv.dconv".to_string())
+        }
+        "backbone.dark4.conv.pointwise" => {
+            make_baseconv("backbone.backbone.dark4.conv.pconv".to_string())
+        }
+
+        "backbone.dark5.conv" => make_baseconv("backbone.backbone.dark5.conv".to_string()),
+        "backbone.dark5.conv.depthwise" => {
+            make_baseconv("backbone.backbone.dark5.conv.dconv".to_string())
+        }
+        "backbone.dark5.conv.pointwise" => {
+            make_baseconv("backbone.backbone.dark5.conv.pconv".to_string())
+        }
+
+        "backbone.dark5.spp.conv1" => {
+            make_baseconv("backbone.backbone.dark5.spp.conv1".to_string())
+        }
+        "backbone.dark5.spp.conv2" => {
+            make_baseconv("backbone.backbone.dark5.spp.conv2".to_string())
+        }
+
+        "pafpn.lateral_conv0" => make_baseconv("backbone.lateral_conv0".to_string()),
+        "pafpn.reduce_conv1" => make_baseconv("backbone.reduce_conv1".to_string()),
+        "pafpn.bu_conv1" => make_baseconv("backbone.bu_conv1".to_string()),
+        "pafpn.bu_conv1.depthwise" => make_baseconv("backbone.bu_conv1.dconv".to_string()),
+        "pafpn.bu_conv1.pointwise" => make_baseconv("backbone.bu_conv1.pconv".to_string()),
+        "pafpn.bu_conv2" => make_baseconv("backbone.bu_conv2".to_string()),
+        "pafpn.bu_conv2.depthwise" => make_baseconv("backbone.bu_conv2.dconv".to_string()),
+        "pafpn.bu_conv2.pointwise" => make_baseconv("backbone.bu_conv2.pconv".to_string()),
+
+        "head.s8.stem" => make_baseconv("head.stems.0".to_string()),
+        "head.s16.stem" => make_baseconv("head.stems.1".to_string()),
+        "head.s32.stem" => make_baseconv("head.stems.2".to_string()),
+
+        "head.s8.cls_conv1" => make_head_conv_mapping(0, "cls_convs", 0, false),
+        "head.s8.cls_conv1.depthwise" => make_head_conv_mapping(0, "cls_convs", 0, true),
+        "head.s8.cls_conv1.pointwise" => make_head_pointwise_mapping(0, "cls_convs", 0),
+        "head.s8.cls_conv2" => make_head_conv_mapping(0, "cls_convs", 1, false),
+        "head.s8.cls_conv2.depthwise" => make_head_conv_mapping(0, "cls_convs", 1, true),
+        "head.s8.cls_conv2.pointwise" => make_head_pointwise_mapping(0, "cls_convs", 1),
+        "head.s8.reg_conv1" => make_head_conv_mapping(0, "reg_convs", 0, false),
+        "head.s8.reg_conv1.depthwise" => make_head_conv_mapping(0, "reg_convs", 0, true),
+        "head.s8.reg_conv1.pointwise" => make_head_pointwise_mapping(0, "reg_convs", 0),
+        "head.s8.reg_conv2" => make_head_conv_mapping(0, "reg_convs", 1, false),
+        "head.s8.reg_conv2.depthwise" => make_head_conv_mapping(0, "reg_convs", 1, true),
+        "head.s8.reg_conv2.pointwise" => make_head_pointwise_mapping(0, "reg_convs", 1),
+        "head.s8.cls_pred" => make_pred("head.cls_preds.0".to_string()),
+        "head.s8.reg_pred" => make_pred("head.reg_preds.0".to_string()),
+        "head.s8.obj_pred" => make_pred("head.obj_preds.0".to_string()),
+
+        "head.s16.cls_conv1" => make_head_conv_mapping(1, "cls_convs", 0, false),
+        "head.s16.cls_conv1.depthwise" => make_head_conv_mapping(1, "cls_convs", 0, true),
+        "head.s16.cls_conv1.pointwise" => make_head_pointwise_mapping(1, "cls_convs", 0),
+        "head.s16.cls_conv2" => make_head_conv_mapping(1, "cls_convs", 1, false),
+        "head.s16.cls_conv2.depthwise" => make_head_conv_mapping(1, "cls_convs", 1, true),
+        "head.s16.cls_conv2.pointwise" => make_head_pointwise_mapping(1, "cls_convs", 1),
+        "head.s16.reg_conv1" => make_head_conv_mapping(1, "reg_convs", 0, false),
+        "head.s16.reg_conv1.depthwise" => make_head_conv_mapping(1, "reg_convs", 0, true),
+        "head.s16.reg_conv1.pointwise" => make_head_pointwise_mapping(1, "reg_convs", 0),
+        "head.s16.reg_conv2" => make_head_conv_mapping(1, "reg_convs", 1, false),
+        "head.s16.reg_conv2.depthwise" => make_head_conv_mapping(1, "reg_convs", 1, true),
+        "head.s16.reg_conv2.pointwise" => make_head_pointwise_mapping(1, "reg_convs", 1),
+        "head.s16.cls_pred" => make_pred("head.cls_preds.1".to_string()),
+        "head.s16.reg_pred" => make_pred("head.reg_preds.1".to_string()),
+        "head.s16.obj_pred" => make_pred("head.obj_preds.1".to_string()),
+
+        "head.s32.cls_conv1" => make_head_conv_mapping(2, "cls_convs", 0, false),
+        "head.s32.cls_conv1.depthwise" => make_head_conv_mapping(2, "cls_convs", 0, true),
+        "head.s32.cls_conv1.pointwise" => make_head_pointwise_mapping(2, "cls_convs", 0),
+        "head.s32.cls_conv2" => make_head_conv_mapping(2, "cls_convs", 1, false),
+        "head.s32.cls_conv2.depthwise" => make_head_conv_mapping(2, "cls_convs", 1, true),
+        "head.s32.cls_conv2.pointwise" => make_head_pointwise_mapping(2, "cls_convs", 1),
+        "head.s32.reg_conv1" => make_head_conv_mapping(2, "reg_convs", 0, false),
+        "head.s32.reg_conv1.depthwise" => make_head_conv_mapping(2, "reg_convs", 0, true),
+        "head.s32.reg_conv1.pointwise" => make_head_pointwise_mapping(2, "reg_convs", 0),
+        "head.s32.reg_conv2" => make_head_conv_mapping(2, "reg_convs", 1, false),
+        "head.s32.reg_conv2.depthwise" => make_head_conv_mapping(2, "reg_convs", 1, true),
+        "head.s32.reg_conv2.pointwise" => make_head_pointwise_mapping(2, "reg_convs", 1),
+        "head.s32.cls_pred" => make_pred("head.cls_preds.2".to_string()),
+        "head.s32.reg_pred" => make_pred("head.reg_preds.2".to_string()),
+        "head.s32.obj_pred" => make_pred("head.obj_preds.2".to_string()),
+
+        _ if name.starts_with("backbone.dark2.c3.") => {
+            make_baseconv(map_csp_bottleneck_prefix(
+                name,
+                "backbone.dark2.c3",
+                "backbone.backbone.dark2.c3",
+            )?)
+        }
+        _ if name.starts_with("backbone.dark3.c3.") => {
+            make_baseconv(map_csp_bottleneck_prefix(
+                name,
+                "backbone.dark3.c3",
+                "backbone.backbone.dark3.c3",
+            )?)
+        }
+        _ if name.starts_with("backbone.dark4.c3.") => {
+            make_baseconv(map_csp_bottleneck_prefix(
+                name,
+                "backbone.dark4.c3",
+                "backbone.backbone.dark4.c3",
+            )?)
+        }
+        _ if name.starts_with("backbone.dark5.c3.") => {
+            make_baseconv(map_csp_bottleneck_prefix(
+                name,
+                "backbone.dark5.c3",
+                "backbone.backbone.dark5.c3",
+            )?)
+        }
+        _ if name.starts_with("pafpn.c3_p4.") => {
+            make_baseconv(map_csp_bottleneck_prefix(
+                name,
+                "pafpn.c3_p4",
+                "backbone.c3_p4",
+            )?)
+        }
+        _ if name.starts_with("pafpn.c3_p3.") => {
+            make_baseconv(map_csp_bottleneck_prefix(
+                name,
+                "pafpn.c3_p3",
+                "backbone.c3_p3",
+            )?)
+        }
+        _ if name.starts_with("pafpn.c3_n3.") => {
+            make_baseconv(map_csp_bottleneck_prefix(
+                name,
+                "pafpn.c3_n3",
+                "backbone.c3_n3",
+            )?)
+        }
+        _ if name.starts_with("pafpn.c3_n4.") => {
+            make_baseconv(map_csp_bottleneck_prefix(
+                name,
+                "pafpn.c3_n4",
+                "backbone.c3_n4",
+            )?)
+        }
+        _ => bail!("mapeamento Burn não definido para a camada `{name}`"),
+    };
+
+    Ok(mapped)
+}
+
+fn map_csp_bottleneck_prefix(name: &str, local_root: &str, burn_root: &str) -> Result<String> {
+    let suffix = name
+        .strip_prefix(local_root)
+        .ok_or_else(|| anyhow::anyhow!("camada inválida `{name}`"))?;
+    let suffix = suffix
+        .replace(".blocks.", ".m.")
+        .replace(".conv2.depthwise", ".conv2.dconv")
+        .replace(".conv2.pointwise", ".conv2.pconv");
+    Ok(format!("{burn_root}{suffix}"))
+}
+
+fn make_head_conv_mapping(
+    scale_index: usize,
+    group: &str,
+    block_index: usize,
+    depthwise: bool,
+) -> ExternalTensorNames {
+    let prefix = if depthwise {
+        format!("head.{group}.{scale_index}.conv{block_index}.dconv")
+    } else {
+        format!("head.{group}.{scale_index}.conv{block_index}")
+    };
+    ExternalTensorNames {
+        weight: format!("{prefix}.conv.weight"),
+        bias: None,
+        bn_scale: Some(format!("{prefix}.bn.gamma")),
+        bn_bias: Some(format!("{prefix}.bn.beta")),
+        bn_mean: Some(format!("{prefix}.bn.running_mean")),
+        bn_var: Some(format!("{prefix}.bn.running_var")),
+    }
+}
+
+fn make_head_pointwise_mapping(
+    scale_index: usize,
+    group: &str,
+    block_index: usize,
+) -> ExternalTensorNames {
+    let prefix = format!("head.{group}.{scale_index}.conv{block_index}.pconv");
+    ExternalTensorNames {
+        weight: format!("{prefix}.conv.weight"),
+        bias: None,
+        bn_scale: Some(format!("{prefix}.bn.gamma")),
+        bn_bias: Some(format!("{prefix}.bn.beta")),
+        bn_mean: Some(format!("{prefix}.bn.running_mean")),
+        bn_var: Some(format!("{prefix}.bn.running_var")),
+    }
 }

@@ -114,7 +114,7 @@ impl Conv2dSpec {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RawConv2dWeights {
     pub spec: Conv2dSpec,
     pub weights: Vec<f32>,
@@ -138,7 +138,7 @@ impl RawConv2dWeights {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BatchNorm1d {
     pub scale: Vec<f32>,
     pub bias: Vec<f32>,

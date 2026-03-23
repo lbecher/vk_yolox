@@ -8,17 +8,23 @@ mod yolox_blocks;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use fused_weights::{BatchNorm1d, Conv2dSpec, RawConv2dWeights, fuse_conv2d_bn};
-use model_bundle::DemoModelBundle;
+use image::{DynamicImage, ImageBuffer, Rgb};
+use model_bundle::{BundleRawWeightPatch, DemoModelBundle};
 use model_plan::{ModelPlan, ModelVariant, build_model_plan, bytes_to_mib};
-use std::{fs, path::PathBuf};
+use serde::Serialize;
+use std::{
+    fs,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use tensor_ops::{
     TensorShape, add_nchw, compare_slices, concat_channels_nchw, focus_nchw, make_demo_tensor,
     maxpool2d_nchw, sigmoid_nchw, silu_nchw, upsample_nearest_nchw,
 };
 use vulkan_conv::{
-    run_conv2d_demo, run_demo_backbone, run_demo_block, run_demo_bottleneck, run_demo_csp,
-    run_demo_dark5, run_demo_decode, run_demo_decode_resident, run_demo_head, run_demo_pafpn,
-    run_demo_stem,
+    GpuDecodeSession, GpuResidentDecodeSession, run_conv2d_demo, run_demo_backbone,
+    run_demo_block, run_demo_bottleneck, run_demo_csp, run_demo_dark5, run_demo_decode,
+    run_demo_decode_resident, run_demo_head, run_demo_pafpn, run_demo_stem,
 };
 use yolox_blocks::{
     BottleneckBlock, CspDarknetDemo, CspStageBlock, Dark5Block, DecodedPredictions, Detection,
@@ -56,11 +62,17 @@ enum Command {
     ExportDemoBundle(ExportDemoBundleArgs),
     InspectBundle(InspectBundleArgs),
     ExportBundleManifest(ExportBundleManifestArgs),
+    ExportBurnMappingManifest(ExportBundleManifestArgs),
     ExportBundleWeights(ExportBundleWeightsArgs),
+    BuildRawPatchFromBurnManifest(BuildRawPatchFromBurnManifestArgs),
     ApplyBundleWeights(ApplyBundleWeightsArgs),
+    ApplyBundleRawWeights(ApplyBundleRawWeightsArgs),
     ExportBundleWeightDir(ExportBundleWeightDirArgs),
     ApplyBundleWeightDir(ApplyBundleWeightDirArgs),
     DemoDetectBundle(DemoDetectBundleArgs),
+    InferBundle(InferBundleArgs),
+    CompareInferBundle(CompareInferBundleArgs),
+    BenchInferBundle(BenchInferBundleArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -451,6 +463,30 @@ struct ApplyBundleWeightsArgs {
 }
 
 #[derive(Debug, Args, Clone)]
+struct ApplyBundleRawWeightsArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+
+    #[arg(long)]
+    raw_weights: PathBuf,
+
+    #[arg(long)]
+    output: PathBuf,
+}
+
+#[derive(Debug, Args, Clone)]
+struct BuildRawPatchFromBurnManifestArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+
+    #[arg(long)]
+    tensor_manifest: PathBuf,
+
+    #[arg(long)]
+    output: PathBuf,
+}
+
+#[derive(Debug, Args, Clone)]
 struct ExportBundleWeightDirArgs {
     #[arg(long)]
     input: PathBuf,
@@ -501,7 +537,209 @@ struct DemoDetectBundleArgs {
     device_index: usize,
 }
 
+#[derive(Debug, Args, Clone)]
+struct InferBundleArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+
+    #[arg(long)]
+    image: PathBuf,
+
+    #[arg(long, default_value_t = 640)]
+    input_h: usize,
+
+    #[arg(long, default_value_t = 640)]
+    input_w: usize,
+
+    #[arg(long, default_value_t = 0.25)]
+    confidence_threshold: f32,
+
+    #[arg(long, default_value_t = 0.65)]
+    nms_threshold: f32,
+
+    #[arg(long, default_value_t = 20)]
+    max_detections: usize,
+
+    #[arg(long)]
+    cpu_only: bool,
+
+    #[arg(long)]
+    resident_weights: bool,
+
+    #[arg(long, default_value_t = 0)]
+    device_index: usize,
+
+    #[arg(long)]
+    output_json: Option<PathBuf>,
+
+    #[arg(long)]
+    output_image: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct CompareInferBundleArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+
+    #[arg(long)]
+    image: PathBuf,
+
+    #[arg(long, default_value_t = 640)]
+    input_h: usize,
+
+    #[arg(long, default_value_t = 640)]
+    input_w: usize,
+
+    #[arg(long, default_value_t = 0.25)]
+    confidence_threshold: f32,
+
+    #[arg(long, default_value_t = 0.65)]
+    nms_threshold: f32,
+
+    #[arg(long, default_value_t = 20)]
+    max_detections: usize,
+
+    #[arg(long)]
+    resident_weights: bool,
+
+    #[arg(long, default_value_t = 0)]
+    device_index: usize,
+
+    #[arg(long)]
+    output_json: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct BenchInferBundleArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+
+    #[arg(long)]
+    image: PathBuf,
+
+    #[arg(long, default_value_t = 640)]
+    input_h: usize,
+
+    #[arg(long, default_value_t = 640)]
+    input_w: usize,
+
+    #[arg(long, default_value_t = 0.25)]
+    confidence_threshold: f32,
+
+    #[arg(long, default_value_t = 0.65)]
+    nms_threshold: f32,
+
+    #[arg(long, default_value_t = 20)]
+    max_detections: usize,
+
+    #[arg(long)]
+    resident_weights: bool,
+
+    #[arg(long, default_value_t = 0)]
+    device_index: usize,
+
+    #[arg(long, default_value_t = 1)]
+    warmup_iterations: usize,
+
+    #[arg(long, default_value_t = 10)]
+    iterations: usize,
+
+    #[arg(long)]
+    cpu_only: bool,
+
+    #[arg(long)]
+    gpu_only: bool,
+
+    #[arg(long)]
+    output_json: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct SerializableDetection {
+    class_id: usize,
+    score: f32,
+    objectness: f32,
+    class_confidence: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct InferenceReport {
+    image: String,
+    original_width: u32,
+    original_height: u32,
+    input_h: usize,
+    input_w: usize,
+    cpu_only: bool,
+    resident_weights: bool,
+    detections: Vec<SerializableDetection>,
+}
+
+#[derive(Debug, Serialize)]
+struct DetectionComparison {
+    index: usize,
+    class_id_cpu: usize,
+    class_id_gpu: usize,
+    score_abs_diff: f32,
+    x0_abs_diff: f32,
+    y0_abs_diff: f32,
+    x1_abs_diff: f32,
+    y1_abs_diff: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct CompareInferenceReport {
+    image: String,
+    input_h: usize,
+    input_w: usize,
+    resident_weights: bool,
+    decoded_elements: usize,
+    decoded_max_abs_diff: f32,
+    decoded_mean_abs_diff: f64,
+    cpu_detection_count: usize,
+    gpu_detection_count: usize,
+    compared_detections: usize,
+    detection_comparisons: Vec<DetectionComparison>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchPathReport {
+    label: String,
+    iterations: usize,
+    warmup_iterations: usize,
+    resident_weights: bool,
+    mean_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
+    median_ms: f64,
+    fps: f64,
+    detection_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchInferenceReport {
+    image: String,
+    input_h: usize,
+    input_w: usize,
+    bundle_load_ms: f64,
+    input_prepare_ms: f64,
+    cpu: Option<BenchPathReport>,
+    gpu: Option<BenchPathReport>,
+}
+
 fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run_main)
+        .context("falha ao criar thread principal com stack ampliada")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("thread principal terminou com panic"))?
+}
+
+fn run_main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli
@@ -526,11 +764,17 @@ fn main() -> Result<()> {
         Command::ExportDemoBundle(args) => export_demo_bundle(args),
         Command::InspectBundle(args) => inspect_bundle(args),
         Command::ExportBundleManifest(args) => export_bundle_manifest(args),
+        Command::ExportBurnMappingManifest(args) => export_burn_mapping_manifest(args),
         Command::ExportBundleWeights(args) => export_bundle_weights(args),
+        Command::BuildRawPatchFromBurnManifest(args) => build_raw_patch_from_burn_manifest(args),
         Command::ApplyBundleWeights(args) => apply_bundle_weights(args),
+        Command::ApplyBundleRawWeights(args) => apply_bundle_raw_weights(args),
         Command::ExportBundleWeightDir(args) => export_bundle_weight_dir(args),
         Command::ApplyBundleWeightDir(args) => apply_bundle_weight_dir(args),
         Command::DemoDetectBundle(args) => demo_detect_bundle(args),
+        Command::InferBundle(args) => infer_bundle(args),
+        Command::CompareInferBundle(args) => compare_infer_bundle(args),
+        Command::BenchInferBundle(args) => bench_infer_bundle(args),
     }
 }
 
@@ -631,6 +875,321 @@ fn print_detections(
             detection.y1,
         );
     }
+}
+
+fn load_image_as_nchw_f32(
+    path: &std::path::Path,
+    input_h: usize,
+    input_w: usize,
+) -> Result<(DynamicImage, TensorShape, Vec<f32>)> {
+    let image =
+        image::open(path).with_context(|| format!("falha ao abrir imagem {}", path.display()))?;
+    let resized = image.resize_exact(
+        input_w as u32,
+        input_h as u32,
+        image::imageops::FilterType::Triangle,
+    );
+    let rgb = resized.to_rgb8().into_raw();
+    let shape = TensorShape::new(3, input_h, input_w);
+    let plane = input_h * input_w;
+    let mut output = vec![0.0f32; shape.len()];
+
+    for y in 0..input_h {
+        for x in 0..input_w {
+            let src = (y * input_w + x) * 3;
+            output[y * input_w + x] = rgb[src] as f32;
+            output[plane + y * input_w + x] = rgb[src + 1] as f32;
+            output[plane * 2 + y * input_w + x] = rgb[src + 2] as f32;
+        }
+    }
+
+    Ok((image, shape, output))
+}
+
+fn scale_detection_to_original(
+    detection: &Detection,
+    original_width: u32,
+    original_height: u32,
+    input_w: usize,
+    input_h: usize,
+) -> SerializableDetection {
+    let scale_x = original_width as f32 / input_w as f32;
+    let scale_y = original_height as f32 / input_h as f32;
+    SerializableDetection {
+        class_id: detection.class_id,
+        score: detection.score,
+        objectness: detection.objectness,
+        class_confidence: detection.class_confidence,
+        x0: (detection.x0 * scale_x).clamp(0.0, original_width as f32),
+        y0: (detection.y0 * scale_y).clamp(0.0, original_height as f32),
+        x1: (detection.x1 * scale_x).clamp(0.0, original_width as f32),
+        y1: (detection.y1 * scale_y).clamp(0.0, original_height as f32),
+    }
+}
+
+fn draw_detection_rectangles(
+    image: DynamicImage,
+    detections: &[SerializableDetection],
+) -> DynamicImage {
+    fn draw_rect(
+        image: &mut ImageBuffer<Rgb<u8>, Vec<u8>>,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+        color: [u8; 3],
+    ) {
+        if x0 >= image.width() || y0 >= image.height() || x1 >= image.width() || y1 >= image.height()
+        {
+            return;
+        }
+        for x in x0..=x1 {
+            *image.get_pixel_mut(x, y0) = Rgb(color);
+            *image.get_pixel_mut(x, y1) = Rgb(color);
+        }
+        for y in y0..=y1 {
+            *image.get_pixel_mut(x0, y) = Rgb(color);
+            *image.get_pixel_mut(x1, y) = Rgb(color);
+        }
+    }
+
+    let mut output = image.to_rgb8();
+    for detection in detections {
+        let x0 = detection.x0.floor().max(0.0) as u32;
+        let y0 = detection.y0.floor().max(0.0) as u32;
+        let x1 = detection.x1.ceil().max(0.0) as u32;
+        let y1 = detection.y1.ceil().max(0.0) as u32;
+        if x1 > x0 && y1 > y0 {
+            draw_rect(&mut output, x0, y0, x1, y1, [239, 62, 5]);
+        }
+    }
+    DynamicImage::ImageRgb8(output)
+}
+
+fn run_bundle_inference(
+    bundle: &DemoModelBundle,
+    input: &[f32],
+    input_shape: TensorShape,
+    confidence_threshold: f32,
+    nms_threshold: f32,
+    max_detections: usize,
+    cpu_only: bool,
+    resident_weights: bool,
+    device_index: usize,
+) -> Result<(DecodedPredictions, Vec<Detection>)> {
+    let (decode, postprocess) = make_bundle_postprocess(
+        bundle,
+        confidence_threshold,
+        nms_threshold,
+        max_detections,
+    );
+
+    if cpu_only {
+        return run_cpu_detect_demo(
+            input,
+            input_shape,
+            &bundle.backbone,
+            &bundle.pafpn,
+            &bundle.head,
+            &decode,
+            &postprocess,
+        );
+    }
+
+    let decoded = if resident_weights {
+        run_demo_decode_resident(
+            input,
+            input_shape,
+            &bundle.backbone,
+            &bundle.pafpn,
+            &bundle.head,
+            &decode,
+            device_index,
+        )?
+    } else {
+        run_demo_decode(
+            input,
+            input_shape,
+            &bundle.backbone,
+            &bundle.pafpn,
+            &bundle.head,
+            &decode,
+            device_index,
+        )?
+    };
+    let detections = postprocess.forward_cpu(&decoded)?;
+    Ok((decoded, detections))
+}
+
+fn make_bundle_postprocess(
+    bundle: &DemoModelBundle,
+    confidence_threshold: f32,
+    nms_threshold: f32,
+    max_detections: usize,
+) -> (YoloxDecodeDemo, YoloxPostprocessDemo) {
+    let decode = YoloxDecodeDemo::new(bundle.meta.num_classes);
+    let postprocess = YoloxPostprocessDemo::new(
+        bundle.meta.num_classes,
+        confidence_threshold,
+        nms_threshold,
+        max_detections,
+    );
+    (decode, postprocess)
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn summarize_bench_samples(
+    label: &str,
+    samples: &[Duration],
+    warmup_iterations: usize,
+    detection_count: usize,
+    resident_weights: bool,
+) -> Result<BenchPathReport> {
+    if samples.is_empty() {
+        bail!("benchmark `{label}` sem amostras");
+    }
+
+    let mut ms = samples.iter().map(|item| duration_ms(*item)).collect::<Vec<_>>();
+    ms.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal));
+
+    let total_ms = ms.iter().sum::<f64>();
+    let mean_ms = total_ms / ms.len() as f64;
+    let median_ms = if ms.len().is_multiple_of(2) {
+        let rhs = ms.len() / 2;
+        let lhs = rhs - 1;
+        (ms[lhs] + ms[rhs]) * 0.5
+    } else {
+        ms[ms.len() / 2]
+    };
+
+    Ok(BenchPathReport {
+        label: label.to_string(),
+        iterations: samples.len(),
+        warmup_iterations,
+        resident_weights,
+        mean_ms,
+        min_ms: *ms.first().unwrap_or(&0.0),
+        max_ms: *ms.last().unwrap_or(&0.0),
+        median_ms,
+        fps: if mean_ms > 0.0 { 1000.0 / mean_ms } else { 0.0 },
+        detection_count,
+    })
+}
+
+fn bench_inference_path(
+    label: &str,
+    bundle: &DemoModelBundle,
+    input: &[f32],
+    input_shape: TensorShape,
+    confidence_threshold: f32,
+    nms_threshold: f32,
+    max_detections: usize,
+    cpu_only: bool,
+    resident_weights: bool,
+    device_index: usize,
+    warmup_iterations: usize,
+    iterations: usize,
+) -> Result<BenchPathReport> {
+    let mut last_detection_count = 0usize;
+    let mut samples = Vec::with_capacity(iterations);
+    let (decode, postprocess) = make_bundle_postprocess(
+        bundle,
+        confidence_threshold,
+        nms_threshold,
+        max_detections,
+    );
+
+    if cpu_only {
+        for _ in 0..warmup_iterations {
+            let (_, detections) = run_cpu_detect_demo(
+                input,
+                input_shape,
+                &bundle.backbone,
+                &bundle.pafpn,
+                &bundle.head,
+                &decode,
+                &postprocess,
+            )?;
+            last_detection_count = detections.len();
+        }
+
+        for _ in 0..iterations {
+            let started = Instant::now();
+            let (_, detections) = run_cpu_detect_demo(
+                input,
+                input_shape,
+                &bundle.backbone,
+                &bundle.pafpn,
+                &bundle.head,
+                &decode,
+                &postprocess,
+            )?;
+            samples.push(started.elapsed());
+            last_detection_count = detections.len();
+        }
+    } else if resident_weights {
+        let session = GpuResidentDecodeSession::new(
+            &bundle.backbone,
+            &bundle.pafpn,
+            &bundle.head,
+            device_index,
+        )?;
+
+        for _ in 0..warmup_iterations {
+            let decoded = session.run_decode(input, input_shape, &decode)?;
+            let detections = postprocess.forward_cpu(&decoded)?;
+            last_detection_count = detections.len();
+        }
+
+        for _ in 0..iterations {
+            let started = Instant::now();
+            let decoded = session.run_decode(input, input_shape, &decode)?;
+            let detections = postprocess.forward_cpu(&decoded)?;
+            samples.push(started.elapsed());
+            last_detection_count = detections.len();
+        }
+    } else {
+        let session = GpuDecodeSession::new(device_index)?;
+
+        for _ in 0..warmup_iterations {
+            let decoded = session.run_decode(
+                input,
+                input_shape,
+                &bundle.backbone,
+                &bundle.pafpn,
+                &bundle.head,
+                &decode,
+            )?;
+            let detections = postprocess.forward_cpu(&decoded)?;
+            last_detection_count = detections.len();
+        }
+
+        for _ in 0..iterations {
+            let started = Instant::now();
+            let decoded = session.run_decode(
+                input,
+                input_shape,
+                &bundle.backbone,
+                &bundle.pafpn,
+                &bundle.head,
+                &decode,
+            )?;
+            let detections = postprocess.forward_cpu(&decoded)?;
+            samples.push(started.elapsed());
+            last_detection_count = detections.len();
+        }
+    }
+
+    summarize_bench_samples(
+        label,
+        &samples,
+        warmup_iterations,
+        last_detection_count,
+        resident_weights,
+    )
 }
 
 fn print_human_summary(plan: &ModelPlan) {
@@ -1722,11 +2281,28 @@ fn export_bundle_manifest(args: ExportBundleManifestArgs) -> Result<()> {
     Ok(())
 }
 
+fn export_burn_mapping_manifest(args: ExportBundleManifestArgs) -> Result<()> {
+    let bundle = DemoModelBundle::load_json(&args.input)?;
+    bundle.save_burn_mapping_manifest_json(&args.output)?;
+    println!("mapeamento Burn salvo em {}", args.output.display());
+    println!("camadas={}", bundle.named_layers().len());
+    Ok(())
+}
+
 fn export_bundle_weights(args: ExportBundleWeightsArgs) -> Result<()> {
     let bundle = DemoModelBundle::load_json(&args.input)?;
     bundle.save_weight_patch_json(&args.output)?;
     println!("patch de pesos salvo em {}", args.output.display());
     println!("camadas={}", bundle.named_layers().len());
+    Ok(())
+}
+
+fn build_raw_patch_from_burn_manifest(args: BuildRawPatchFromBurnManifestArgs) -> Result<()> {
+    let bundle = DemoModelBundle::load_json(&args.bundle)?;
+    let patch = bundle.build_raw_patch_from_external_manifest(&args.tensor_manifest)?;
+    bundle.save_raw_weight_patch_json(&patch, &args.output)?;
+    println!("patch raw gerado em {}", args.output.display());
+    println!("camadas={}", patch.layers.len());
     Ok(())
 }
 
@@ -1739,6 +2315,17 @@ fn apply_bundle_weights(args: ApplyBundleWeightsArgs) -> Result<()> {
     bundle.apply_weight_patch(&patch)?;
     bundle.save_json(&args.output)?;
     println!("bundle atualizado salvo em {}", args.output.display());
+    println!("{}", bundle.summary());
+    Ok(())
+}
+
+fn apply_bundle_raw_weights(args: ApplyBundleRawWeightsArgs) -> Result<()> {
+    let mut bundle = DemoModelBundle::load_json(&args.bundle)?;
+    let patch: BundleRawWeightPatch = DemoModelBundle::load_raw_weight_patch_json(&args.raw_weights)
+        .with_context(|| format!("falha ao carregar patch raw {}", args.raw_weights.display()))?;
+    bundle.apply_raw_weight_patch(&patch)?;
+    bundle.save_json(&args.output)?;
+    println!("bundle atualizado com pesos raw salvo em {}", args.output.display());
     println!("{}", bundle.summary());
     Ok(())
 }
@@ -1855,6 +2442,340 @@ fn demo_detect_bundle(args: DemoDetectBundleArgs) -> Result<()> {
         diff.max_abs_diff,
         diff.mean_abs_diff,
     );
+
+    Ok(())
+}
+
+fn infer_bundle(args: InferBundleArgs) -> Result<()> {
+    let bundle = DemoModelBundle::load_json(&args.bundle)?;
+    validate_detect_args(
+        "infer-bundle",
+        args.input_h,
+        args.input_w,
+        bundle.meta.num_classes,
+        args.max_detections,
+        args.confidence_threshold,
+        args.nms_threshold,
+    )?;
+
+    let (original_image, input_shape, input) =
+        load_image_as_nchw_f32(&args.image, args.input_h, args.input_w)?;
+    let (decoded, detections) = run_bundle_inference(
+        &bundle,
+        &input,
+        input_shape,
+        args.confidence_threshold,
+        args.nms_threshold,
+        args.max_detections,
+        args.cpu_only,
+        args.resident_weights,
+        args.device_index,
+    )?;
+
+    print_detections(
+        "infer bundle",
+        input_shape,
+        &decoded,
+        &detections,
+        args.confidence_threshold,
+        args.nms_threshold,
+    );
+
+    let original_width = original_image.width();
+    let original_height = original_image.height();
+    let serializable = detections
+        .iter()
+        .map(|detection| {
+            scale_detection_to_original(
+                detection,
+                original_width,
+                original_height,
+                args.input_w,
+                args.input_h,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let report = InferenceReport {
+        image: args.image.display().to_string(),
+        original_width,
+        original_height,
+        input_h: args.input_h,
+        input_w: args.input_w,
+        cpu_only: args.cpu_only,
+        resident_weights: args.resident_weights,
+        detections: serializable,
+    };
+
+    if let Some(path) = &args.output_json {
+        let serialized = serde_json::to_string_pretty(&report)
+            .context("falha ao serializar relatório de inferência")?;
+        fs::write(path, serialized)
+            .with_context(|| format!("falha ao escrever {}", path.display()))?;
+        println!("relatório salvo em {}", path.display());
+    }
+
+    if let Some(path) = &args.output_image {
+        let annotated = draw_detection_rectangles(original_image, &report.detections);
+        annotated
+            .save(path)
+            .with_context(|| format!("falha ao salvar {}", path.display()))?;
+        println!("imagem anotada salva em {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn bench_infer_bundle(args: BenchInferBundleArgs) -> Result<()> {
+    if args.cpu_only && args.gpu_only {
+        bail!("use apenas um entre --cpu-only e --gpu-only");
+    }
+    if args.iterations == 0 {
+        bail!("iterations deve ser maior que zero");
+    }
+
+    let bundle_started = Instant::now();
+    let bundle = DemoModelBundle::load_json(&args.bundle)?;
+    let bundle_load_elapsed = bundle_started.elapsed();
+
+    validate_detect_args(
+        "bench-infer-bundle",
+        args.input_h,
+        args.input_w,
+        bundle.meta.num_classes,
+        args.max_detections,
+        args.confidence_threshold,
+        args.nms_threshold,
+    )?;
+
+    let input_started = Instant::now();
+    let (_original_image, input_shape, input) =
+        load_image_as_nchw_f32(&args.image, args.input_h, args.input_w)?;
+    let input_prepare_elapsed = input_started.elapsed();
+
+    let run_cpu = !args.gpu_only;
+    let run_gpu = !args.cpu_only;
+
+    let cpu = if run_cpu {
+        Some(bench_inference_path(
+            "cpu",
+            &bundle,
+            &input,
+            input_shape,
+            args.confidence_threshold,
+            args.nms_threshold,
+            args.max_detections,
+            true,
+            false,
+            args.device_index,
+            args.warmup_iterations,
+            args.iterations,
+        )?)
+    } else {
+        None
+    };
+
+    let gpu = if run_gpu {
+        Some(bench_inference_path(
+            if args.resident_weights {
+                "gpu-resident"
+            } else {
+                "gpu"
+            },
+            &bundle,
+            &input,
+            input_shape,
+            args.confidence_threshold,
+            args.nms_threshold,
+            args.max_detections,
+            false,
+            args.resident_weights,
+            args.device_index,
+            args.warmup_iterations,
+            args.iterations,
+        )?)
+    } else {
+        None
+    };
+
+    println!(
+        "bench infer bundle: bundle_load={:.3}ms input_prepare={:.3}ms warmup={} iterations={}",
+        duration_ms(bundle_load_elapsed),
+        duration_ms(input_prepare_elapsed),
+        args.warmup_iterations,
+        args.iterations,
+    );
+
+    if let Some(report) = &cpu {
+        println!(
+            "{}: mean={:.3}ms median={:.3}ms min={:.3}ms max={:.3}ms fps={:.2} detections={}",
+            report.label,
+            report.mean_ms,
+            report.median_ms,
+            report.min_ms,
+            report.max_ms,
+            report.fps,
+            report.detection_count,
+        );
+    }
+
+    if let Some(report) = &gpu {
+        println!(
+            "{}: mean={:.3}ms median={:.3}ms min={:.3}ms max={:.3}ms fps={:.2} detections={}",
+            report.label,
+            report.mean_ms,
+            report.median_ms,
+            report.min_ms,
+            report.max_ms,
+            report.fps,
+            report.detection_count,
+        );
+    }
+
+    if let (Some(cpu), Some(gpu)) = (&cpu, &gpu) {
+        println!(
+            "speedup gpu/cpu: {:.2}x",
+            if gpu.mean_ms > 0.0 {
+                cpu.mean_ms / gpu.mean_ms
+            } else {
+                0.0
+            }
+        );
+    }
+
+    if let Some(path) = &args.output_json {
+        let report = BenchInferenceReport {
+            image: args.image.display().to_string(),
+            input_h: args.input_h,
+            input_w: args.input_w,
+            bundle_load_ms: duration_ms(bundle_load_elapsed),
+            input_prepare_ms: duration_ms(input_prepare_elapsed),
+            cpu,
+            gpu,
+        };
+        let serialized =
+            serde_json::to_string_pretty(&report).context("falha ao serializar benchmark")?;
+        fs::write(path, serialized)
+            .with_context(|| format!("falha ao escrever {}", path.display()))?;
+        println!("relatório salvo em {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn compare_infer_bundle(args: CompareInferBundleArgs) -> Result<()> {
+    let bundle = DemoModelBundle::load_json(&args.bundle)?;
+    validate_detect_args(
+        "compare-infer-bundle",
+        args.input_h,
+        args.input_w,
+        bundle.meta.num_classes,
+        args.max_detections,
+        args.confidence_threshold,
+        args.nms_threshold,
+    )?;
+
+    let (_original_image, input_shape, input) =
+        load_image_as_nchw_f32(&args.image, args.input_h, args.input_w)?;
+
+    let (cpu_decoded, cpu_detections) = run_bundle_inference(
+        &bundle,
+        &input,
+        input_shape,
+        args.confidence_threshold,
+        args.nms_threshold,
+        args.max_detections,
+        true,
+        false,
+        args.device_index,
+    )?;
+    let (gpu_decoded, gpu_detections) = run_bundle_inference(
+        &bundle,
+        &input,
+        input_shape,
+        args.confidence_threshold,
+        args.nms_threshold,
+        args.max_detections,
+        false,
+        args.resident_weights,
+        args.device_index,
+    )?;
+
+    if cpu_decoded.rows != gpu_decoded.rows || cpu_decoded.cols != gpu_decoded.cols {
+        bail!(
+            "shape final divergente: cpu=[{}x{}] gpu=[{}x{}]",
+            cpu_decoded.rows,
+            cpu_decoded.cols,
+            gpu_decoded.rows,
+            gpu_decoded.cols
+        );
+    }
+
+    let diff = compare_slices(&cpu_decoded.data, &gpu_decoded.data)?;
+    let compared = cpu_detections.len().min(gpu_detections.len());
+    let detection_comparisons = (0..compared)
+        .map(|index| {
+            let cpu = &cpu_detections[index];
+            let gpu = &gpu_detections[index];
+            DetectionComparison {
+                index,
+                class_id_cpu: cpu.class_id,
+                class_id_gpu: gpu.class_id,
+                score_abs_diff: (cpu.score - gpu.score).abs(),
+                x0_abs_diff: (cpu.x0 - gpu.x0).abs(),
+                y0_abs_diff: (cpu.y0 - gpu.y0).abs(),
+                x1_abs_diff: (cpu.x1 - gpu.x1).abs(),
+                y1_abs_diff: (cpu.y1 - gpu.y1).abs(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    println!(
+        "compare infer bundle: decoded_elements={} max_abs_diff={:.8} mean_abs_diff={:.8}",
+        cpu_decoded.data.len(),
+        diff.max_abs_diff,
+        diff.mean_abs_diff,
+    );
+    println!(
+        "detections cpu={} gpu={} compared={}",
+        cpu_detections.len(),
+        gpu_detections.len(),
+        compared,
+    );
+    for item in detection_comparisons.iter().take(5) {
+        println!(
+            "det {:02}: class cpu/gpu={}/{} score_diff={:.6} box_diff=[{:.3}, {:.3}, {:.3}, {:.3}]",
+            item.index,
+            item.class_id_cpu,
+            item.class_id_gpu,
+            item.score_abs_diff,
+            item.x0_abs_diff,
+            item.y0_abs_diff,
+            item.x1_abs_diff,
+            item.y1_abs_diff,
+        );
+    }
+
+    if let Some(path) = &args.output_json {
+        let report = CompareInferenceReport {
+            image: args.image.display().to_string(),
+            input_h: args.input_h,
+            input_w: args.input_w,
+            resident_weights: args.resident_weights,
+            decoded_elements: cpu_decoded.data.len(),
+            decoded_max_abs_diff: diff.max_abs_diff,
+            decoded_mean_abs_diff: diff.mean_abs_diff,
+            cpu_detection_count: cpu_detections.len(),
+            gpu_detection_count: gpu_detections.len(),
+            compared_detections: compared,
+            detection_comparisons,
+        };
+        let serialized = serde_json::to_string_pretty(&report)
+            .context("falha ao serializar relatório de comparação")?;
+        fs::write(path, serialized)
+            .with_context(|| format!("falha ao escrever {}", path.display()))?;
+        println!("relatório salvo em {}", path.display());
+    }
 
     Ok(())
 }
