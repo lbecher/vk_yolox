@@ -13,8 +13,7 @@ use model_bundle::{BundleRawWeightPatch, DemoModelBundle};
 use model_plan::{ModelPlan, ModelVariant, build_model_plan, bytes_to_mib};
 use serde::Serialize;
 use std::{
-    env,
-    fs,
+    env, fs,
     path::PathBuf,
     process::Command as ProcessCommand,
     time::{Duration, Instant},
@@ -24,9 +23,10 @@ use tensor_ops::{
     maxpool2d_nchw, sigmoid_nchw, silu_nchw, upsample_nearest_nchw,
 };
 use vulkan_conv::{
-    GpuDecodeSession, GpuResidentDecodeSession, query_vulkan_device_info, run_conv2d_demo,
-    run_demo_backbone, run_demo_block, run_demo_bottleneck, run_demo_csp, run_demo_dark5,
-    run_demo_decode, run_demo_decode_resident, run_demo_head, run_demo_pafpn, run_demo_stem,
+    GpuDecodeSession, GpuResidentDecodeSession, query_vulkan_device_info,
+    query_vulkan_fp16_support, run_conv2d_demo, run_demo_backbone, run_demo_block,
+    run_demo_bottleneck, run_demo_csp, run_demo_dark5, run_demo_decode, run_demo_decode_resident,
+    run_demo_head, run_demo_pafpn, run_demo_stem,
 };
 use yolox_blocks::{
     BottleneckBlock, CspDarknetDemo, CspStageBlock, Dark5Block, DecodedPredictions, Detection,
@@ -47,6 +47,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Inspect(InspectArgs),
+    InspectVulkanDevice(InspectVulkanDeviceArgs),
     DemoConv(DemoConvArgs),
     DemoDepthwise(DemoDepthwiseArgs),
     DemoBlock(DemoBlockArgs),
@@ -93,6 +94,15 @@ struct InspectArgs {
 
     #[arg(long)]
     output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct InspectVulkanDeviceArgs {
+    #[arg(long, default_value_t = 0)]
+    device_index: usize,
+
+    #[arg(long)]
+    json: bool,
 }
 
 impl Default for InspectArgs {
@@ -568,6 +578,9 @@ struct InferBundleArgs {
     #[arg(long)]
     resident_weights: bool,
 
+    #[arg(long)]
+    fp16: bool,
+
     #[arg(long, default_value_t = 0)]
     device_index: usize,
 
@@ -604,6 +617,9 @@ struct CompareInferBundleArgs {
     #[arg(long)]
     resident_weights: bool,
 
+    #[arg(long)]
+    fp16: bool,
+
     #[arg(long, default_value_t = 0)]
     device_index: usize,
 
@@ -636,6 +652,9 @@ struct BenchInferBundleArgs {
 
     #[arg(long)]
     resident_weights: bool,
+
+    #[arg(long)]
+    fp16: bool,
 
     #[arg(long, default_value_t = 0)]
     device_index: usize,
@@ -889,6 +908,7 @@ fn run_main() -> Result<()> {
         .unwrap_or(Command::Inspect(InspectArgs::default()))
     {
         Command::Inspect(args) => inspect(args),
+        Command::InspectVulkanDevice(args) => inspect_vulkan_device(args),
         Command::DemoConv(args) => demo_conv(args),
         Command::DemoDepthwise(args) => demo_depthwise(args),
         Command::DemoBlock(args) => demo_block(args),
@@ -939,6 +959,65 @@ fn inspect(args: InspectArgs) -> Result<()> {
     } else {
         print_human_summary(&plan);
     }
+
+    Ok(())
+}
+
+fn inspect_vulkan_device(args: InspectVulkanDeviceArgs) -> Result<()> {
+    let info = query_vulkan_fp16_support(args.device_index)?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "device_index": args.device_index,
+                "device_name": info.device_name,
+                "api_version": info.api_version,
+                "driver_name": info.driver_name,
+                "driver_info": info.driver_info,
+                "fp16": {
+                    "extension_khr_shader_float16_int8": info.extension_khr_shader_float16_int8,
+                    "shader_float16": info.shader_float16,
+                    "storage_buffer16_bit_access": info.storage_buffer16_bit_access,
+                    "uniform_and_storage_buffer16_bit_access": info.uniform_and_storage_buffer16_bit_access,
+                    "storage_input_output16": info.storage_input_output16,
+                    "workgroup_memory_explicit_layout16_bit_access": info.workgroup_memory_explicit_layout16_bit_access,
+                    "shader_denorm_flush_to_zero_float16": info.shader_denorm_flush_to_zero_float16,
+                    "shader_denorm_preserve_float16": info.shader_denorm_preserve_float16,
+                    "shader_rounding_mode_rte_float16": info.shader_rounding_mode_rte_float16,
+                    "shader_rounding_mode_rtz_float16": info.shader_rounding_mode_rtz_float16,
+                }
+            }))
+            .context("falha ao serializar inspeção Vulkan")?
+        );
+        return Ok(());
+    }
+
+    println!("device_index={}", args.device_index);
+    println!("device_name={}", info.device_name);
+    println!("api_version={}", info.api_version);
+    if let Some(driver_name) = &info.driver_name {
+        println!("driver_name={}", driver_name);
+    }
+    if let Some(driver_info) = &info.driver_info {
+        println!("driver_info={}", driver_info);
+    }
+    println!(
+        "fp16: shader_float16={} khr_shader_float16_int8={} storage_buffer16_bit_access={} uniform_and_storage_buffer16_bit_access={} storage_input_output16={} workgroup_memory_explicit_layout16_bit_access={}",
+        info.shader_float16,
+        info.extension_khr_shader_float16_int8,
+        info.storage_buffer16_bit_access,
+        info.uniform_and_storage_buffer16_bit_access,
+        info.storage_input_output16,
+        info.workgroup_memory_explicit_layout16_bit_access,
+    );
+    println!(
+        "fp16_properties: denorm_flush_to_zero={:?} denorm_preserve={:?} rounding_rte={:?} rounding_rtz={:?}",
+        info.shader_denorm_flush_to_zero_float16,
+        info.shader_denorm_preserve_float16,
+        info.shader_rounding_mode_rte_float16,
+        info.shader_rounding_mode_rtz_float16,
+    );
 
     Ok(())
 }
@@ -1132,7 +1211,10 @@ fn draw_detection_rectangles(
         y1: u32,
         color: [u8; 3],
     ) {
-        if x0 >= image.width() || y0 >= image.height() || x1 >= image.width() || y1 >= image.height()
+        if x0 >= image.width()
+            || y0 >= image.height()
+            || x1 >= image.width()
+            || y1 >= image.height()
         {
             return;
         }
@@ -1168,16 +1250,16 @@ fn run_bundle_inference(
     max_detections: usize,
     cpu_only: bool,
     resident_weights: bool,
+    fp16: bool,
     device_index: usize,
 ) -> Result<(DecodedPredictions, Vec<Detection>)> {
-    let (decode, postprocess) = make_bundle_postprocess(
-        bundle,
-        confidence_threshold,
-        nms_threshold,
-        max_detections,
-    );
+    let (decode, postprocess) =
+        make_bundle_postprocess(bundle, confidence_threshold, nms_threshold, max_detections);
 
     if cpu_only {
+        if fp16 {
+            bail!("--fp16 só é suportado no caminho GPU");
+        }
         return run_cpu_detect_demo(
             input,
             input_shape,
@@ -1189,6 +1271,10 @@ fn run_bundle_inference(
         );
     }
 
+    if fp16 && !resident_weights {
+        bail!("--fp16 experimental exige --resident-weights");
+    }
+
     let decoded = if resident_weights {
         run_demo_decode_resident(
             input,
@@ -1197,6 +1283,7 @@ fn run_bundle_inference(
             &bundle.pafpn,
             &bundle.head,
             &decode,
+            fp16,
             device_index,
         )?
     } else {
@@ -1239,7 +1326,10 @@ fn summarize_stage_samples(samples: &[Duration]) -> Result<BenchStageReport> {
         bail!("benchmark por etapa sem amostras");
     }
 
-    let mut ms = samples.iter().map(|item| duration_ms(*item)).collect::<Vec<_>>();
+    let mut ms = samples
+        .iter()
+        .map(|item| duration_ms(*item))
+        .collect::<Vec<_>>();
     ms.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal));
 
     let total_ms = ms.iter().sum::<f64>();
@@ -1282,7 +1372,10 @@ fn summarize_bench_samples(
         bail!("benchmark `{label}` sem amostras");
     }
 
-    let mut ms = samples.iter().map(|item| duration_ms(*item)).collect::<Vec<_>>();
+    let mut ms = samples
+        .iter()
+        .map(|item| duration_ms(*item))
+        .collect::<Vec<_>>();
     ms.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal));
 
     let total_ms = ms.iter().sum::<f64>();
@@ -1320,7 +1413,11 @@ fn print_stage_breakdown(label: &str, stages: &BenchStageBreakdownReport) {
             stages.pafpn.mean_ms,
             stages.head.mean_ms,
             stages.decode.mean_ms,
-            stages.readback.as_ref().map(|item| item.mean_ms).unwrap_or(0.0),
+            stages
+                .readback
+                .as_ref()
+                .map(|item| item.mean_ms)
+                .unwrap_or(0.0),
             stages.nms.mean_ms,
         );
     } else {
@@ -1346,6 +1443,7 @@ fn bench_inference_path(
     max_detections: usize,
     cpu_only: bool,
     resident_weights: bool,
+    fp16: bool,
     device_index: usize,
     warmup_iterations: usize,
     iterations: usize,
@@ -1359,14 +1457,13 @@ fn bench_inference_path(
     let mut decode_samples = Vec::with_capacity(iterations);
     let mut readback_samples = Vec::with_capacity(iterations);
     let mut nms_samples = Vec::with_capacity(iterations);
-    let (decode, postprocess) = make_bundle_postprocess(
-        bundle,
-        confidence_threshold,
-        nms_threshold,
-        max_detections,
-    );
+    let (decode, postprocess) =
+        make_bundle_postprocess(bundle, confidence_threshold, nms_threshold, max_detections);
 
     if cpu_only {
+        if fp16 {
+            bail!("--fp16 só é suportado no caminho GPU");
+        }
         for _ in 0..warmup_iterations {
             let (_, detections, _) = run_cpu_detect_demo_profiled(
                 input,
@@ -1409,6 +1506,7 @@ fn bench_inference_path(
             &bundle.backbone,
             &bundle.pafpn,
             &bundle.head,
+            fp16,
             device_index,
         )?;
 
@@ -1419,7 +1517,8 @@ fn bench_inference_path(
         }
 
         for _ in 0..iterations {
-            let (decoded, stage_timings) = session.run_decode_profiled(input, input_shape, &decode)?;
+            let (decoded, stage_timings) =
+                session.run_decode_profiled(input, input_shape, &decode)?;
             let started = Instant::now();
             let detections = postprocess.forward_cpu(&decoded)?;
             let nms_time = started.elapsed();
@@ -1441,6 +1540,9 @@ fn bench_inference_path(
             last_detection_count = detections.len();
         }
     } else {
+        if fp16 {
+            bail!("--fp16 experimental exige --resident-weights");
+        }
         let session = GpuDecodeSession::new(device_index)?;
 
         for _ in 0..warmup_iterations {
@@ -1502,9 +1604,11 @@ fn bench_inference_path(
             &bundle.backbone,
             &bundle.pafpn,
             &bundle.head,
+            fp16,
             device_index,
         )?;
-        let (decoded, sync_stage_timings) = session.run_decode_profiled_sync(input, input_shape, &decode)?;
+        let (decoded, sync_stage_timings) =
+            session.run_decode_profiled_sync(input, input_shape, &decode)?;
         let started = Instant::now();
         let _detections = postprocess.forward_cpu(&decoded)?;
         let sync_nms = started.elapsed();
@@ -2548,6 +2652,7 @@ fn demo_detect_resident(args: DemoDetectArgs) -> Result<()> {
         &pafpn,
         &head,
         &decode,
+        false,
         args.device_index,
     )?;
 
@@ -2682,11 +2787,16 @@ fn apply_bundle_weights(args: ApplyBundleWeightsArgs) -> Result<()> {
 
 fn apply_bundle_raw_weights(args: ApplyBundleRawWeightsArgs) -> Result<()> {
     let mut bundle = DemoModelBundle::load_json(&args.bundle)?;
-    let patch: BundleRawWeightPatch = DemoModelBundle::load_raw_weight_patch_json(&args.raw_weights)
-        .with_context(|| format!("falha ao carregar patch raw {}", args.raw_weights.display()))?;
+    let patch: BundleRawWeightPatch =
+        DemoModelBundle::load_raw_weight_patch_json(&args.raw_weights).with_context(|| {
+            format!("falha ao carregar patch raw {}", args.raw_weights.display())
+        })?;
     bundle.apply_raw_weight_patch(&patch)?;
     bundle.save_json(&args.output)?;
-    println!("bundle atualizado com pesos raw salvo em {}", args.output.display());
+    println!(
+        "bundle atualizado com pesos raw salvo em {}",
+        args.output.display()
+    );
     println!("{}", bundle.summary());
     Ok(())
 }
@@ -2761,6 +2871,7 @@ fn demo_detect_bundle(args: DemoDetectBundleArgs) -> Result<()> {
             &bundle.pafpn,
             &bundle.head,
             &decode,
+            false,
             args.device_index,
         )?
     } else {
@@ -2830,6 +2941,7 @@ fn infer_bundle(args: InferBundleArgs) -> Result<()> {
         args.max_detections,
         args.cpu_only,
         args.resident_weights,
+        args.fp16,
         args.device_index,
     )?;
 
@@ -2929,6 +3041,7 @@ fn bench_infer_bundle(args: BenchInferBundleArgs) -> Result<()> {
             args.max_detections,
             true,
             false,
+            false,
             args.device_index,
             args.warmup_iterations,
             args.iterations,
@@ -2952,6 +3065,7 @@ fn bench_infer_bundle(args: BenchInferBundleArgs) -> Result<()> {
             args.max_detections,
             false,
             args.resident_weights,
+            args.fp16,
             args.device_index,
             args.warmup_iterations,
             args.iterations,
@@ -3052,6 +3166,7 @@ fn compare_infer_bundle(args: CompareInferBundleArgs) -> Result<()> {
         args.max_detections,
         true,
         false,
+        false,
         args.device_index,
     )?;
     let (gpu_decoded, gpu_detections) = run_bundle_inference(
@@ -3063,6 +3178,7 @@ fn compare_infer_bundle(args: CompareInferBundleArgs) -> Result<()> {
         args.max_detections,
         false,
         args.resident_weights,
+        args.fp16,
         args.device_index,
     )?;
 

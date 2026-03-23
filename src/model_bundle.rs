@@ -508,7 +508,11 @@ impl DemoModelBundle {
         })
     }
 
-    pub fn save_raw_weight_patch_json(&self, patch: &BundleRawWeightPatch, path: &Path) -> Result<()> {
+    pub fn save_raw_weight_patch_json(
+        &self,
+        patch: &BundleRawWeightPatch,
+        path: &Path,
+    ) -> Result<()> {
         let serialized = serde_json::to_string_pretty(patch)
             .context("falha ao serializar patch raw de pesos")?;
         fs::write(path, serialized)
@@ -1305,167 +1309,144 @@ fn burn_external_names(name: &str) -> Result<ExternalTensorNames> {
         bn_var: None,
     };
 
-    let mapped = match name {
-        "backbone.stem.conv" => make_baseconv("backbone.backbone.stem.conv".to_string()),
+    let mapped =
+        match name {
+            "backbone.stem.conv" => make_baseconv("backbone.backbone.stem.conv".to_string()),
 
-        "backbone.dark2.conv" => make_baseconv("backbone.backbone.dark2.conv".to_string()),
-        "backbone.dark2.conv.depthwise" => {
-            make_baseconv("backbone.backbone.dark2.conv.dconv".to_string())
-        }
-        "backbone.dark2.conv.pointwise" => {
-            make_baseconv("backbone.backbone.dark2.conv.pconv".to_string())
-        }
+            "backbone.dark2.conv" => make_baseconv("backbone.backbone.dark2.conv".to_string()),
+            "backbone.dark2.conv.depthwise" => {
+                make_baseconv("backbone.backbone.dark2.conv.dconv".to_string())
+            }
+            "backbone.dark2.conv.pointwise" => {
+                make_baseconv("backbone.backbone.dark2.conv.pconv".to_string())
+            }
 
-        "backbone.dark3.conv" => make_baseconv("backbone.backbone.dark3.conv".to_string()),
-        "backbone.dark3.conv.depthwise" => {
-            make_baseconv("backbone.backbone.dark3.conv.dconv".to_string())
-        }
-        "backbone.dark3.conv.pointwise" => {
-            make_baseconv("backbone.backbone.dark3.conv.pconv".to_string())
-        }
+            "backbone.dark3.conv" => make_baseconv("backbone.backbone.dark3.conv".to_string()),
+            "backbone.dark3.conv.depthwise" => {
+                make_baseconv("backbone.backbone.dark3.conv.dconv".to_string())
+            }
+            "backbone.dark3.conv.pointwise" => {
+                make_baseconv("backbone.backbone.dark3.conv.pconv".to_string())
+            }
 
-        "backbone.dark4.conv" => make_baseconv("backbone.backbone.dark4.conv".to_string()),
-        "backbone.dark4.conv.depthwise" => {
-            make_baseconv("backbone.backbone.dark4.conv.dconv".to_string())
-        }
-        "backbone.dark4.conv.pointwise" => {
-            make_baseconv("backbone.backbone.dark4.conv.pconv".to_string())
-        }
+            "backbone.dark4.conv" => make_baseconv("backbone.backbone.dark4.conv".to_string()),
+            "backbone.dark4.conv.depthwise" => {
+                make_baseconv("backbone.backbone.dark4.conv.dconv".to_string())
+            }
+            "backbone.dark4.conv.pointwise" => {
+                make_baseconv("backbone.backbone.dark4.conv.pconv".to_string())
+            }
 
-        "backbone.dark5.conv" => make_baseconv("backbone.backbone.dark5.conv".to_string()),
-        "backbone.dark5.conv.depthwise" => {
-            make_baseconv("backbone.backbone.dark5.conv.dconv".to_string())
-        }
-        "backbone.dark5.conv.pointwise" => {
-            make_baseconv("backbone.backbone.dark5.conv.pconv".to_string())
-        }
+            "backbone.dark5.conv" => make_baseconv("backbone.backbone.dark5.conv".to_string()),
+            "backbone.dark5.conv.depthwise" => {
+                make_baseconv("backbone.backbone.dark5.conv.dconv".to_string())
+            }
+            "backbone.dark5.conv.pointwise" => {
+                make_baseconv("backbone.backbone.dark5.conv.pconv".to_string())
+            }
 
-        "backbone.dark5.spp.conv1" => {
-            make_baseconv("backbone.backbone.dark5.spp.conv1".to_string())
-        }
-        "backbone.dark5.spp.conv2" => {
-            make_baseconv("backbone.backbone.dark5.spp.conv2".to_string())
-        }
+            "backbone.dark5.spp.conv1" => {
+                make_baseconv("backbone.backbone.dark5.spp.conv1".to_string())
+            }
+            "backbone.dark5.spp.conv2" => {
+                make_baseconv("backbone.backbone.dark5.spp.conv2".to_string())
+            }
 
-        "pafpn.lateral_conv0" => make_baseconv("backbone.lateral_conv0".to_string()),
-        "pafpn.reduce_conv1" => make_baseconv("backbone.reduce_conv1".to_string()),
-        "pafpn.bu_conv1" => make_baseconv("backbone.bu_conv1".to_string()),
-        "pafpn.bu_conv1.depthwise" => make_baseconv("backbone.bu_conv1.dconv".to_string()),
-        "pafpn.bu_conv1.pointwise" => make_baseconv("backbone.bu_conv1.pconv".to_string()),
-        "pafpn.bu_conv2" => make_baseconv("backbone.bu_conv2".to_string()),
-        "pafpn.bu_conv2.depthwise" => make_baseconv("backbone.bu_conv2.dconv".to_string()),
-        "pafpn.bu_conv2.pointwise" => make_baseconv("backbone.bu_conv2.pconv".to_string()),
+            "pafpn.lateral_conv0" => make_baseconv("backbone.lateral_conv0".to_string()),
+            "pafpn.reduce_conv1" => make_baseconv("backbone.reduce_conv1".to_string()),
+            "pafpn.bu_conv1" => make_baseconv("backbone.bu_conv1".to_string()),
+            "pafpn.bu_conv1.depthwise" => make_baseconv("backbone.bu_conv1.dconv".to_string()),
+            "pafpn.bu_conv1.pointwise" => make_baseconv("backbone.bu_conv1.pconv".to_string()),
+            "pafpn.bu_conv2" => make_baseconv("backbone.bu_conv2".to_string()),
+            "pafpn.bu_conv2.depthwise" => make_baseconv("backbone.bu_conv2.dconv".to_string()),
+            "pafpn.bu_conv2.pointwise" => make_baseconv("backbone.bu_conv2.pconv".to_string()),
 
-        "head.s8.stem" => make_baseconv("head.stems.0".to_string()),
-        "head.s16.stem" => make_baseconv("head.stems.1".to_string()),
-        "head.s32.stem" => make_baseconv("head.stems.2".to_string()),
+            "head.s8.stem" => make_baseconv("head.stems.0".to_string()),
+            "head.s16.stem" => make_baseconv("head.stems.1".to_string()),
+            "head.s32.stem" => make_baseconv("head.stems.2".to_string()),
 
-        "head.s8.cls_conv1" => make_head_conv_mapping(0, "cls_convs", 0, false),
-        "head.s8.cls_conv1.depthwise" => make_head_conv_mapping(0, "cls_convs", 0, true),
-        "head.s8.cls_conv1.pointwise" => make_head_pointwise_mapping(0, "cls_convs", 0),
-        "head.s8.cls_conv2" => make_head_conv_mapping(0, "cls_convs", 1, false),
-        "head.s8.cls_conv2.depthwise" => make_head_conv_mapping(0, "cls_convs", 1, true),
-        "head.s8.cls_conv2.pointwise" => make_head_pointwise_mapping(0, "cls_convs", 1),
-        "head.s8.reg_conv1" => make_head_conv_mapping(0, "reg_convs", 0, false),
-        "head.s8.reg_conv1.depthwise" => make_head_conv_mapping(0, "reg_convs", 0, true),
-        "head.s8.reg_conv1.pointwise" => make_head_pointwise_mapping(0, "reg_convs", 0),
-        "head.s8.reg_conv2" => make_head_conv_mapping(0, "reg_convs", 1, false),
-        "head.s8.reg_conv2.depthwise" => make_head_conv_mapping(0, "reg_convs", 1, true),
-        "head.s8.reg_conv2.pointwise" => make_head_pointwise_mapping(0, "reg_convs", 1),
-        "head.s8.cls_pred" => make_pred("head.cls_preds.0".to_string()),
-        "head.s8.reg_pred" => make_pred("head.reg_preds.0".to_string()),
-        "head.s8.obj_pred" => make_pred("head.obj_preds.0".to_string()),
+            "head.s8.cls_conv1" => make_head_conv_mapping(0, "cls_convs", 0, false),
+            "head.s8.cls_conv1.depthwise" => make_head_conv_mapping(0, "cls_convs", 0, true),
+            "head.s8.cls_conv1.pointwise" => make_head_pointwise_mapping(0, "cls_convs", 0),
+            "head.s8.cls_conv2" => make_head_conv_mapping(0, "cls_convs", 1, false),
+            "head.s8.cls_conv2.depthwise" => make_head_conv_mapping(0, "cls_convs", 1, true),
+            "head.s8.cls_conv2.pointwise" => make_head_pointwise_mapping(0, "cls_convs", 1),
+            "head.s8.reg_conv1" => make_head_conv_mapping(0, "reg_convs", 0, false),
+            "head.s8.reg_conv1.depthwise" => make_head_conv_mapping(0, "reg_convs", 0, true),
+            "head.s8.reg_conv1.pointwise" => make_head_pointwise_mapping(0, "reg_convs", 0),
+            "head.s8.reg_conv2" => make_head_conv_mapping(0, "reg_convs", 1, false),
+            "head.s8.reg_conv2.depthwise" => make_head_conv_mapping(0, "reg_convs", 1, true),
+            "head.s8.reg_conv2.pointwise" => make_head_pointwise_mapping(0, "reg_convs", 1),
+            "head.s8.cls_pred" => make_pred("head.cls_preds.0".to_string()),
+            "head.s8.reg_pred" => make_pred("head.reg_preds.0".to_string()),
+            "head.s8.obj_pred" => make_pred("head.obj_preds.0".to_string()),
 
-        "head.s16.cls_conv1" => make_head_conv_mapping(1, "cls_convs", 0, false),
-        "head.s16.cls_conv1.depthwise" => make_head_conv_mapping(1, "cls_convs", 0, true),
-        "head.s16.cls_conv1.pointwise" => make_head_pointwise_mapping(1, "cls_convs", 0),
-        "head.s16.cls_conv2" => make_head_conv_mapping(1, "cls_convs", 1, false),
-        "head.s16.cls_conv2.depthwise" => make_head_conv_mapping(1, "cls_convs", 1, true),
-        "head.s16.cls_conv2.pointwise" => make_head_pointwise_mapping(1, "cls_convs", 1),
-        "head.s16.reg_conv1" => make_head_conv_mapping(1, "reg_convs", 0, false),
-        "head.s16.reg_conv1.depthwise" => make_head_conv_mapping(1, "reg_convs", 0, true),
-        "head.s16.reg_conv1.pointwise" => make_head_pointwise_mapping(1, "reg_convs", 0),
-        "head.s16.reg_conv2" => make_head_conv_mapping(1, "reg_convs", 1, false),
-        "head.s16.reg_conv2.depthwise" => make_head_conv_mapping(1, "reg_convs", 1, true),
-        "head.s16.reg_conv2.pointwise" => make_head_pointwise_mapping(1, "reg_convs", 1),
-        "head.s16.cls_pred" => make_pred("head.cls_preds.1".to_string()),
-        "head.s16.reg_pred" => make_pred("head.reg_preds.1".to_string()),
-        "head.s16.obj_pred" => make_pred("head.obj_preds.1".to_string()),
+            "head.s16.cls_conv1" => make_head_conv_mapping(1, "cls_convs", 0, false),
+            "head.s16.cls_conv1.depthwise" => make_head_conv_mapping(1, "cls_convs", 0, true),
+            "head.s16.cls_conv1.pointwise" => make_head_pointwise_mapping(1, "cls_convs", 0),
+            "head.s16.cls_conv2" => make_head_conv_mapping(1, "cls_convs", 1, false),
+            "head.s16.cls_conv2.depthwise" => make_head_conv_mapping(1, "cls_convs", 1, true),
+            "head.s16.cls_conv2.pointwise" => make_head_pointwise_mapping(1, "cls_convs", 1),
+            "head.s16.reg_conv1" => make_head_conv_mapping(1, "reg_convs", 0, false),
+            "head.s16.reg_conv1.depthwise" => make_head_conv_mapping(1, "reg_convs", 0, true),
+            "head.s16.reg_conv1.pointwise" => make_head_pointwise_mapping(1, "reg_convs", 0),
+            "head.s16.reg_conv2" => make_head_conv_mapping(1, "reg_convs", 1, false),
+            "head.s16.reg_conv2.depthwise" => make_head_conv_mapping(1, "reg_convs", 1, true),
+            "head.s16.reg_conv2.pointwise" => make_head_pointwise_mapping(1, "reg_convs", 1),
+            "head.s16.cls_pred" => make_pred("head.cls_preds.1".to_string()),
+            "head.s16.reg_pred" => make_pred("head.reg_preds.1".to_string()),
+            "head.s16.obj_pred" => make_pred("head.obj_preds.1".to_string()),
 
-        "head.s32.cls_conv1" => make_head_conv_mapping(2, "cls_convs", 0, false),
-        "head.s32.cls_conv1.depthwise" => make_head_conv_mapping(2, "cls_convs", 0, true),
-        "head.s32.cls_conv1.pointwise" => make_head_pointwise_mapping(2, "cls_convs", 0),
-        "head.s32.cls_conv2" => make_head_conv_mapping(2, "cls_convs", 1, false),
-        "head.s32.cls_conv2.depthwise" => make_head_conv_mapping(2, "cls_convs", 1, true),
-        "head.s32.cls_conv2.pointwise" => make_head_pointwise_mapping(2, "cls_convs", 1),
-        "head.s32.reg_conv1" => make_head_conv_mapping(2, "reg_convs", 0, false),
-        "head.s32.reg_conv1.depthwise" => make_head_conv_mapping(2, "reg_convs", 0, true),
-        "head.s32.reg_conv1.pointwise" => make_head_pointwise_mapping(2, "reg_convs", 0),
-        "head.s32.reg_conv2" => make_head_conv_mapping(2, "reg_convs", 1, false),
-        "head.s32.reg_conv2.depthwise" => make_head_conv_mapping(2, "reg_convs", 1, true),
-        "head.s32.reg_conv2.pointwise" => make_head_pointwise_mapping(2, "reg_convs", 1),
-        "head.s32.cls_pred" => make_pred("head.cls_preds.2".to_string()),
-        "head.s32.reg_pred" => make_pred("head.reg_preds.2".to_string()),
-        "head.s32.obj_pred" => make_pred("head.obj_preds.2".to_string()),
+            "head.s32.cls_conv1" => make_head_conv_mapping(2, "cls_convs", 0, false),
+            "head.s32.cls_conv1.depthwise" => make_head_conv_mapping(2, "cls_convs", 0, true),
+            "head.s32.cls_conv1.pointwise" => make_head_pointwise_mapping(2, "cls_convs", 0),
+            "head.s32.cls_conv2" => make_head_conv_mapping(2, "cls_convs", 1, false),
+            "head.s32.cls_conv2.depthwise" => make_head_conv_mapping(2, "cls_convs", 1, true),
+            "head.s32.cls_conv2.pointwise" => make_head_pointwise_mapping(2, "cls_convs", 1),
+            "head.s32.reg_conv1" => make_head_conv_mapping(2, "reg_convs", 0, false),
+            "head.s32.reg_conv1.depthwise" => make_head_conv_mapping(2, "reg_convs", 0, true),
+            "head.s32.reg_conv1.pointwise" => make_head_pointwise_mapping(2, "reg_convs", 0),
+            "head.s32.reg_conv2" => make_head_conv_mapping(2, "reg_convs", 1, false),
+            "head.s32.reg_conv2.depthwise" => make_head_conv_mapping(2, "reg_convs", 1, true),
+            "head.s32.reg_conv2.pointwise" => make_head_pointwise_mapping(2, "reg_convs", 1),
+            "head.s32.cls_pred" => make_pred("head.cls_preds.2".to_string()),
+            "head.s32.reg_pred" => make_pred("head.reg_preds.2".to_string()),
+            "head.s32.obj_pred" => make_pred("head.obj_preds.2".to_string()),
 
-        _ if name.starts_with("backbone.dark2.c3.") => {
-            make_baseconv(map_csp_bottleneck_prefix(
-                name,
-                "backbone.dark2.c3",
-                "backbone.backbone.dark2.c3",
-            )?)
-        }
-        _ if name.starts_with("backbone.dark3.c3.") => {
-            make_baseconv(map_csp_bottleneck_prefix(
-                name,
-                "backbone.dark3.c3",
-                "backbone.backbone.dark3.c3",
-            )?)
-        }
-        _ if name.starts_with("backbone.dark4.c3.") => {
-            make_baseconv(map_csp_bottleneck_prefix(
-                name,
-                "backbone.dark4.c3",
-                "backbone.backbone.dark4.c3",
-            )?)
-        }
-        _ if name.starts_with("backbone.dark5.c3.") => {
-            make_baseconv(map_csp_bottleneck_prefix(
-                name,
-                "backbone.dark5.c3",
-                "backbone.backbone.dark5.c3",
-            )?)
-        }
-        _ if name.starts_with("pafpn.c3_p4.") => {
-            make_baseconv(map_csp_bottleneck_prefix(
+            _ if name.starts_with("backbone.dark2.c3.") => make_baseconv(
+                map_csp_bottleneck_prefix(name, "backbone.dark2.c3", "backbone.backbone.dark2.c3")?,
+            ),
+            _ if name.starts_with("backbone.dark3.c3.") => make_baseconv(
+                map_csp_bottleneck_prefix(name, "backbone.dark3.c3", "backbone.backbone.dark3.c3")?,
+            ),
+            _ if name.starts_with("backbone.dark4.c3.") => make_baseconv(
+                map_csp_bottleneck_prefix(name, "backbone.dark4.c3", "backbone.backbone.dark4.c3")?,
+            ),
+            _ if name.starts_with("backbone.dark5.c3.") => make_baseconv(
+                map_csp_bottleneck_prefix(name, "backbone.dark5.c3", "backbone.backbone.dark5.c3")?,
+            ),
+            _ if name.starts_with("pafpn.c3_p4.") => make_baseconv(map_csp_bottleneck_prefix(
                 name,
                 "pafpn.c3_p4",
                 "backbone.c3_p4",
-            )?)
-        }
-        _ if name.starts_with("pafpn.c3_p3.") => {
-            make_baseconv(map_csp_bottleneck_prefix(
+            )?),
+            _ if name.starts_with("pafpn.c3_p3.") => make_baseconv(map_csp_bottleneck_prefix(
                 name,
                 "pafpn.c3_p3",
                 "backbone.c3_p3",
-            )?)
-        }
-        _ if name.starts_with("pafpn.c3_n3.") => {
-            make_baseconv(map_csp_bottleneck_prefix(
+            )?),
+            _ if name.starts_with("pafpn.c3_n3.") => make_baseconv(map_csp_bottleneck_prefix(
                 name,
                 "pafpn.c3_n3",
                 "backbone.c3_n3",
-            )?)
-        }
-        _ if name.starts_with("pafpn.c3_n4.") => {
-            make_baseconv(map_csp_bottleneck_prefix(
+            )?),
+            _ if name.starts_with("pafpn.c3_n4.") => make_baseconv(map_csp_bottleneck_prefix(
                 name,
                 "pafpn.c3_n4",
                 "backbone.c3_n4",
-            )?)
-        }
-        _ => bail!("mapeamento Burn não definido para a camada `{name}`"),
-    };
+            )?),
+            _ => bail!("mapeamento Burn não definido para a camada `{name}`"),
+        };
 
     Ok(mapped)
 }

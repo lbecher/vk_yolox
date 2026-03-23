@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use half::f16;
 use naga::{
     back::spv::{Options as SpvOptions, PipelineOptions as SpvPipelineOptions, write_vec},
     front::wgsl,
@@ -48,6 +49,9 @@ use crate::{
 
 const IMAGE_LOCAL_SIZE_X: u32 = 8;
 const IMAGE_LOCAL_SIZE_Y: u32 = 8;
+const FP16_CONV3X3_LOCAL_SIZE_X: u32 = 8;
+const FP16_CONV3X3_LOCAL_SIZE_Y: u32 = 8;
+const FP16_CONV3X3_OUTPUT_CHANNELS_PER_INVOCATION: u32 = 2;
 const LINEAR_LOCAL_SIZE_X: u32 = 64;
 const MATRIX_LOCAL_SIZE_X: u32 = 16;
 const MATRIX_LOCAL_SIZE_Y: u32 = 16;
@@ -66,7 +70,8 @@ struct BufferU32 { data: array<u32>, }
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ox = gid.x;
     let oy = gid.y;
-    let oc = gid.z;
+    let oc0 = gid.z * 2u;
+    let oc1 = oc0 + 1u;
 
     let in_channels = params_buffer.data[0];
     let out_channels = params_buffer.data[1];
@@ -166,6 +171,301 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let output_index = ((oc * output_h + oy) * output_w) + ox;
     output_buffer.data[output_index] = acc / (1.0 + exp(-acc));
+}
+"#;
+
+const CONV2D_FP16_WEIGHTS_WGSL: &str = r#"
+enable f16;
+
+struct BufferF32 { data: array<f32>, }
+struct BufferF16 { data: array<f16>, }
+struct BufferU32 { data: array<u32>, }
+
+@group(0) @binding(0) var<storage, read> input_buffer: BufferF32;
+@group(0) @binding(1) var<storage, read> weight_buffer: BufferF16;
+@group(0) @binding(2) var<storage, read> bias_buffer: BufferF32;
+@group(0) @binding(3) var<storage, read_write> output_buffer: BufferF32;
+@group(0) @binding(4) var<storage, read> params_buffer: BufferU32;
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ox = gid.x;
+    let oy = gid.y;
+    let oc = gid.z;
+
+    let in_channels = params_buffer.data[0];
+    let out_channels = params_buffer.data[1];
+    let input_h = params_buffer.data[2];
+    let input_w = params_buffer.data[3];
+    let kernel_h = params_buffer.data[4];
+    let kernel_w = params_buffer.data[5];
+    let stride_h = params_buffer.data[6];
+    let stride_w = params_buffer.data[7];
+    let pad_h = params_buffer.data[8];
+    let pad_w = params_buffer.data[9];
+    let groups = params_buffer.data[10];
+    let in_channels_per_group = params_buffer.data[11];
+    let output_h = params_buffer.data[12];
+    let output_w = params_buffer.data[13];
+
+    if (ox >= output_w || oy >= output_h || oc >= out_channels) { return; }
+
+    var acc = f16(bias_buffer.data[oc]);
+    let out_channels_per_group = out_channels / groups;
+    let group = oc / out_channels_per_group;
+    let ic_start = group * in_channels_per_group;
+    let ic_end = ic_start + in_channels_per_group;
+
+    for (var ic: u32 = ic_start; ic < ic_end; ic = ic + 1u) {
+        let group_ic = ic - ic_start;
+        for (var ky: u32 = 0u; ky < kernel_h; ky = ky + 1u) {
+            let src_y = i32(oy * stride_h + ky) - i32(pad_h);
+            if (src_y < 0 || src_y >= i32(input_h)) { continue; }
+            for (var kx: u32 = 0u; kx < kernel_w; kx = kx + 1u) {
+                let src_x = i32(ox * stride_w + kx) - i32(pad_w);
+                if (src_x < 0 || src_x >= i32(input_w)) { continue; }
+                let input_index = ((ic * input_h + u32(src_y)) * input_w) + u32(src_x);
+                let weight_index = (((oc * in_channels_per_group + group_ic) * kernel_h + ky) * kernel_w) + kx;
+                acc = acc + f16(input_buffer.data[input_index]) * weight_buffer.data[weight_index];
+            }
+        }
+    }
+
+    let output_index = ((oc * output_h + oy) * output_w) + ox;
+    output_buffer.data[output_index] = f32(acc);
+}
+"#;
+
+const CONV2D_SILU_FP16_WEIGHTS_WGSL: &str = r#"
+enable f16;
+
+struct BufferF32 { data: array<f32>, }
+struct BufferF16 { data: array<f16>, }
+struct BufferU32 { data: array<u32>, }
+
+@group(0) @binding(0) var<storage, read> input_buffer: BufferF32;
+@group(0) @binding(1) var<storage, read> weight_buffer: BufferF16;
+@group(0) @binding(2) var<storage, read> bias_buffer: BufferF32;
+@group(0) @binding(3) var<storage, read_write> output_buffer: BufferF32;
+@group(0) @binding(4) var<storage, read> params_buffer: BufferU32;
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ox = gid.x;
+    let oy = gid.y;
+    let oc = gid.z;
+
+    let out_channels = params_buffer.data[1];
+    let input_h = params_buffer.data[2];
+    let input_w = params_buffer.data[3];
+    let kernel_h = params_buffer.data[4];
+    let kernel_w = params_buffer.data[5];
+    let stride_h = params_buffer.data[6];
+    let stride_w = params_buffer.data[7];
+    let pad_h = params_buffer.data[8];
+    let pad_w = params_buffer.data[9];
+    let groups = params_buffer.data[10];
+    let in_channels_per_group = params_buffer.data[11];
+    let output_h = params_buffer.data[12];
+    let output_w = params_buffer.data[13];
+
+    if (ox >= output_w || oy >= output_h || oc >= out_channels) { return; }
+
+    var acc = f16(bias_buffer.data[oc]);
+    let out_channels_per_group = out_channels / groups;
+    let group = oc / out_channels_per_group;
+    let ic_start = group * in_channels_per_group;
+    let ic_end = ic_start + in_channels_per_group;
+
+    for (var ic: u32 = ic_start; ic < ic_end; ic = ic + 1u) {
+        let group_ic = ic - ic_start;
+        for (var ky: u32 = 0u; ky < kernel_h; ky = ky + 1u) {
+            let src_y = i32(oy * stride_h + ky) - i32(pad_h);
+            if (src_y < 0 || src_y >= i32(input_h)) { continue; }
+            for (var kx: u32 = 0u; kx < kernel_w; kx = kx + 1u) {
+                let src_x = i32(ox * stride_w + kx) - i32(pad_w);
+                if (src_x < 0 || src_x >= i32(input_w)) { continue; }
+                let input_index = ((ic * input_h + u32(src_y)) * input_w) + u32(src_x);
+                let weight_index = (((oc * in_channels_per_group + group_ic) * kernel_h + ky) * kernel_w) + kx;
+                acc = acc + f16(input_buffer.data[input_index]) * weight_buffer.data[weight_index];
+            }
+        }
+    }
+
+    let acc32 = f32(acc);
+    let output_index = ((oc * output_h + oy) * output_w) + ox;
+    output_buffer.data[output_index] = acc32 / (1.0 + exp(-acc32));
+}
+"#;
+
+const CONV2D_1X1_FP16_WEIGHTS_WGSL: &str = r#"
+enable f16;
+
+struct BufferF32 { data: array<f32>, }
+struct BufferF16 { data: array<f16>, }
+struct BufferU32 { data: array<u32>, }
+
+@group(0) @binding(0) var<storage, read> input_buffer: BufferF32;
+@group(0) @binding(1) var<storage, read> weight_buffer: BufferF16;
+@group(0) @binding(2) var<storage, read> bias_buffer: BufferF32;
+@group(0) @binding(3) var<storage, read_write> output_buffer: BufferF32;
+@group(0) @binding(4) var<storage, read> params_buffer: BufferU32;
+
+fn dot4_f16(a: vec4<f16>, b: vec4<f16>) -> f16 {
+    let prod = a * b;
+    return prod.x + prod.y + prod.z + prod.w;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ox = gid.x;
+    let oy = gid.y;
+    let oc = gid.z;
+
+    let out_channels = params_buffer.data[1];
+    let input_h = params_buffer.data[2];
+    let input_w = params_buffer.data[3];
+    let stride_h = params_buffer.data[6];
+    let stride_w = params_buffer.data[7];
+    let groups = params_buffer.data[10];
+    let in_channels_per_group = params_buffer.data[11];
+    let output_h = params_buffer.data[12];
+    let output_w = params_buffer.data[13];
+
+    if (ox >= output_w || oy >= output_h || oc >= out_channels) { return; }
+
+    var acc = f16(bias_buffer.data[oc]);
+    let out_channels_per_group = out_channels / groups;
+    let group = oc / out_channels_per_group;
+    let ic_start = group * in_channels_per_group;
+    let ic_end = ic_start + in_channels_per_group;
+    let src_y = oy * stride_h;
+    let src_x = ox * stride_w;
+
+    var ic = ic_start;
+    loop {
+        if (ic + 3u >= ic_end) {
+            break;
+        }
+
+        let group_ic = ic - ic_start;
+        let input_index0 = ((ic * input_h + src_y) * input_w) + src_x;
+        let input_index1 = (((ic + 1u) * input_h + src_y) * input_w) + src_x;
+        let input_index2 = (((ic + 2u) * input_h + src_y) * input_w) + src_x;
+        let input_index3 = (((ic + 3u) * input_h + src_y) * input_w) + src_x;
+        let weight_index = (oc * in_channels_per_group) + group_ic;
+
+        let input_vec = vec4<f16>(
+            f16(input_buffer.data[input_index0]),
+            f16(input_buffer.data[input_index1]),
+            f16(input_buffer.data[input_index2]),
+            f16(input_buffer.data[input_index3]),
+        );
+        let weight_vec = vec4<f16>(
+            weight_buffer.data[weight_index],
+            weight_buffer.data[weight_index + 1u],
+            weight_buffer.data[weight_index + 2u],
+            weight_buffer.data[weight_index + 3u],
+        );
+        acc = acc + dot4_f16(input_vec, weight_vec);
+        ic = ic + 4u;
+    }
+
+    for (; ic < ic_end; ic = ic + 1u) {
+        let group_ic = ic - ic_start;
+        let input_index = ((ic * input_h + src_y) * input_w) + src_x;
+        let weight_index = (oc * in_channels_per_group) + group_ic;
+        acc = acc + f16(input_buffer.data[input_index]) * weight_buffer.data[weight_index];
+    }
+
+    let output_index = ((oc * output_h + oy) * output_w) + ox;
+    output_buffer.data[output_index] = f32(acc);
+}
+"#;
+
+const CONV2D_1X1_SILU_FP16_WEIGHTS_WGSL: &str = r#"
+enable f16;
+
+struct BufferF32 { data: array<f32>, }
+struct BufferF16 { data: array<f16>, }
+struct BufferU32 { data: array<u32>, }
+
+@group(0) @binding(0) var<storage, read> input_buffer: BufferF32;
+@group(0) @binding(1) var<storage, read> weight_buffer: BufferF16;
+@group(0) @binding(2) var<storage, read> bias_buffer: BufferF32;
+@group(0) @binding(3) var<storage, read_write> output_buffer: BufferF32;
+@group(0) @binding(4) var<storage, read> params_buffer: BufferU32;
+
+fn dot4_f16(a: vec4<f16>, b: vec4<f16>) -> f16 {
+    let prod = a * b;
+    return prod.x + prod.y + prod.z + prod.w;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ox = gid.x;
+    let oy = gid.y;
+    let oc = gid.z;
+
+    let out_channels = params_buffer.data[1];
+    let input_h = params_buffer.data[2];
+    let input_w = params_buffer.data[3];
+    let stride_h = params_buffer.data[6];
+    let stride_w = params_buffer.data[7];
+    let groups = params_buffer.data[10];
+    let in_channels_per_group = params_buffer.data[11];
+    let output_h = params_buffer.data[12];
+    let output_w = params_buffer.data[13];
+
+    if (ox >= output_w || oy >= output_h || oc >= out_channels) { return; }
+
+    var acc = f16(bias_buffer.data[oc]);
+    let out_channels_per_group = out_channels / groups;
+    let group = oc / out_channels_per_group;
+    let ic_start = group * in_channels_per_group;
+    let ic_end = ic_start + in_channels_per_group;
+    let src_y = oy * stride_h;
+    let src_x = ox * stride_w;
+
+    var ic = ic_start;
+    loop {
+        if (ic + 3u >= ic_end) {
+            break;
+        }
+
+        let group_ic = ic - ic_start;
+        let input_index0 = ((ic * input_h + src_y) * input_w) + src_x;
+        let input_index1 = (((ic + 1u) * input_h + src_y) * input_w) + src_x;
+        let input_index2 = (((ic + 2u) * input_h + src_y) * input_w) + src_x;
+        let input_index3 = (((ic + 3u) * input_h + src_y) * input_w) + src_x;
+        let weight_index = (oc * in_channels_per_group) + group_ic;
+
+        let input_vec = vec4<f16>(
+            f16(input_buffer.data[input_index0]),
+            f16(input_buffer.data[input_index1]),
+            f16(input_buffer.data[input_index2]),
+            f16(input_buffer.data[input_index3]),
+        );
+        let weight_vec = vec4<f16>(
+            weight_buffer.data[weight_index],
+            weight_buffer.data[weight_index + 1u],
+            weight_buffer.data[weight_index + 2u],
+            weight_buffer.data[weight_index + 3u],
+        );
+        acc = acc + dot4_f16(input_vec, weight_vec);
+        ic = ic + 4u;
+    }
+
+    for (; ic < ic_end; ic = ic + 1u) {
+        let group_ic = ic - ic_start;
+        let input_index = ((ic * input_h + src_y) * input_w) + src_x;
+        let weight_index = (oc * in_channels_per_group) + group_ic;
+        acc = acc + f16(input_buffer.data[input_index]) * weight_buffer.data[weight_index];
+    }
+
+    let acc32 = f32(acc);
+    let output_index = ((oc * output_h + oy) * output_w) + ox;
+    output_buffer.data[output_index] = acc32 / (1.0 + exp(-acc32));
 }
 "#;
 
@@ -389,6 +689,247 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let output_index = ((oc * output_h + oy) * output_w) + ox;
     output_buffer.data[output_index] = acc / (1.0 + exp(-acc));
+}
+"#;
+
+const CONV2D_3X3_FP16_WEIGHTS_WGSL: &str = r#"
+enable f16;
+
+struct BufferF32 { data: array<f32>, }
+struct BufferF16 { data: array<f16>, }
+struct BufferU32 { data: array<u32>, }
+
+@group(0) @binding(0) var<storage, read> input_buffer: BufferF32;
+@group(0) @binding(1) var<storage, read> weight_buffer: BufferF16;
+@group(0) @binding(2) var<storage, read> bias_buffer: BufferF32;
+@group(0) @binding(3) var<storage, read_write> output_buffer: BufferF32;
+@group(0) @binding(4) var<storage, read> params_buffer: BufferU32;
+
+fn dot4_f16(a: vec4<f16>, b: vec4<f16>) -> f16 {
+    let prod = a * b;
+    return prod.x + prod.y + prod.z + prod.w;
+}
+
+fn sample_or_zero(
+    channel: u32,
+    y: i32,
+    x: i32,
+    input_h: u32,
+    input_w: u32,
+) -> f32 {
+    if (y < 0 || y >= i32(input_h) || x < 0 || x >= i32(input_w)) {
+        return 0.0;
+    }
+    let index = ((channel * input_h + u32(y)) * input_w) + u32(x);
+    return input_buffer.data[index];
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ox = gid.x;
+    let oy = gid.y;
+    let oc = gid.z;
+
+    let in_channels = params_buffer.data[0];
+    let out_channels = params_buffer.data[1];
+    let input_h = params_buffer.data[2];
+    let input_w = params_buffer.data[3];
+    let stride_h = params_buffer.data[6];
+    let stride_w = params_buffer.data[7];
+    let output_h = params_buffer.data[12];
+    let output_w = params_buffer.data[13];
+
+    if (ox >= output_w || oy >= output_h || oc0 >= out_channels) { return; }
+
+    var acc0 = f16(bias_buffer.data[oc0]);
+    var acc1 = f16(0.0);
+    let has_oc1 = oc1 < out_channels;
+    if (has_oc1) {
+        acc1 = f16(bias_buffer.data[oc1]);
+    }
+    let base_y = i32(oy * stride_h) - 1;
+    let base_x = i32(ox * stride_w) - 1;
+
+    for (var ic: u32 = 0u; ic < in_channels; ic = ic + 1u) {
+        let wbase0 = (oc0 * in_channels + ic) * 9u;
+        let wbase1 = (oc1 * in_channels + ic) * 9u;
+        let input_vec0 = vec4<f16>(
+            f16(sample_or_zero(ic, base_y, base_x, input_h, input_w)),
+            f16(sample_or_zero(ic, base_y, base_x + 1, input_h, input_w)),
+            f16(sample_or_zero(ic, base_y, base_x + 2, input_h, input_w)),
+            f16(sample_or_zero(ic, base_y + 1, base_x, input_h, input_w)),
+        );
+        let weight0_vec0 = vec4<f16>(
+            weight_buffer.data[wbase0],
+            weight_buffer.data[wbase0 + 1u],
+            weight_buffer.data[wbase0 + 2u],
+            weight_buffer.data[wbase0 + 3u],
+        );
+        let input_vec1 = vec4<f16>(
+            f16(sample_or_zero(ic, base_y + 1, base_x + 1, input_h, input_w)),
+            f16(sample_or_zero(ic, base_y + 1, base_x + 2, input_h, input_w)),
+            f16(sample_or_zero(ic, base_y + 2, base_x, input_h, input_w)),
+            f16(sample_or_zero(ic, base_y + 2, base_x + 1, input_h, input_w)),
+        );
+        let weight0_vec1 = vec4<f16>(
+            weight_buffer.data[wbase0 + 4u],
+            weight_buffer.data[wbase0 + 5u],
+            weight_buffer.data[wbase0 + 6u],
+            weight_buffer.data[wbase0 + 7u],
+        );
+        let input_scalar =
+            f16(sample_or_zero(ic, base_y + 2, base_x + 2, input_h, input_w));
+        acc0 = acc0 + dot4_f16(input_vec0, weight0_vec0);
+        acc0 = acc0 + dot4_f16(input_vec1, weight0_vec1);
+        acc0 = acc0
+            + input_scalar * weight_buffer.data[wbase0 + 8u];
+        if (has_oc1) {
+            let weight1_vec0 = vec4<f16>(
+                weight_buffer.data[wbase1],
+                weight_buffer.data[wbase1 + 1u],
+                weight_buffer.data[wbase1 + 2u],
+                weight_buffer.data[wbase1 + 3u],
+            );
+            let weight1_vec1 = vec4<f16>(
+                weight_buffer.data[wbase1 + 4u],
+                weight_buffer.data[wbase1 + 5u],
+                weight_buffer.data[wbase1 + 6u],
+                weight_buffer.data[wbase1 + 7u],
+            );
+            acc1 = acc1 + dot4_f16(input_vec0, weight1_vec0);
+            acc1 = acc1 + dot4_f16(input_vec1, weight1_vec1);
+            acc1 = acc1
+                + input_scalar * weight_buffer.data[wbase1 + 8u];
+        }
+    }
+
+    let output_index0 = ((oc0 * output_h + oy) * output_w) + ox;
+    output_buffer.data[output_index0] = f32(acc0);
+    if (has_oc1) {
+        let output_index1 = ((oc1 * output_h + oy) * output_w) + ox;
+        output_buffer.data[output_index1] = f32(acc1);
+    }
+}
+"#;
+
+const CONV2D_3X3_SILU_FP16_WEIGHTS_WGSL: &str = r#"
+enable f16;
+
+struct BufferF32 { data: array<f32>, }
+struct BufferF16 { data: array<f16>, }
+struct BufferU32 { data: array<u32>, }
+
+@group(0) @binding(0) var<storage, read> input_buffer: BufferF32;
+@group(0) @binding(1) var<storage, read> weight_buffer: BufferF16;
+@group(0) @binding(2) var<storage, read> bias_buffer: BufferF32;
+@group(0) @binding(3) var<storage, read_write> output_buffer: BufferF32;
+@group(0) @binding(4) var<storage, read> params_buffer: BufferU32;
+
+fn dot4_f16(a: vec4<f16>, b: vec4<f16>) -> f16 {
+    let prod = a * b;
+    return prod.x + prod.y + prod.z + prod.w;
+}
+
+fn sample_or_zero(
+    channel: u32,
+    y: i32,
+    x: i32,
+    input_h: u32,
+    input_w: u32,
+) -> f32 {
+    if (y < 0 || y >= i32(input_h) || x < 0 || x >= i32(input_w)) {
+        return 0.0;
+    }
+    let index = ((channel * input_h + u32(y)) * input_w) + u32(x);
+    return input_buffer.data[index];
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ox = gid.x;
+    let oy = gid.y;
+    let oc0 = gid.z * 2u;
+    let oc1 = oc0 + 1u;
+
+    let in_channels = params_buffer.data[0];
+    let out_channels = params_buffer.data[1];
+    let input_h = params_buffer.data[2];
+    let input_w = params_buffer.data[3];
+    let stride_h = params_buffer.data[6];
+    let stride_w = params_buffer.data[7];
+    let output_h = params_buffer.data[12];
+    let output_w = params_buffer.data[13];
+
+    if (ox >= output_w || oy >= output_h || oc0 >= out_channels) { return; }
+
+    var acc0 = f16(bias_buffer.data[oc0]);
+    var acc1 = f16(0.0);
+    let has_oc1 = oc1 < out_channels;
+    if (has_oc1) {
+        acc1 = f16(bias_buffer.data[oc1]);
+    }
+    let base_y = i32(oy * stride_h) - 1;
+    let base_x = i32(ox * stride_w) - 1;
+
+    for (var ic: u32 = 0u; ic < in_channels; ic = ic + 1u) {
+        let wbase0 = (oc0 * in_channels + ic) * 9u;
+        let wbase1 = (oc1 * in_channels + ic) * 9u;
+        let input_vec0 = vec4<f16>(
+            f16(sample_or_zero(ic, base_y, base_x, input_h, input_w)),
+            f16(sample_or_zero(ic, base_y, base_x + 1, input_h, input_w)),
+            f16(sample_or_zero(ic, base_y, base_x + 2, input_h, input_w)),
+            f16(sample_or_zero(ic, base_y + 1, base_x, input_h, input_w)),
+        );
+        let weight0_vec0 = vec4<f16>(
+            weight_buffer.data[wbase0],
+            weight_buffer.data[wbase0 + 1u],
+            weight_buffer.data[wbase0 + 2u],
+            weight_buffer.data[wbase0 + 3u],
+        );
+        let input_vec1 = vec4<f16>(
+            f16(sample_or_zero(ic, base_y + 1, base_x + 1, input_h, input_w)),
+            f16(sample_or_zero(ic, base_y + 1, base_x + 2, input_h, input_w)),
+            f16(sample_or_zero(ic, base_y + 2, base_x, input_h, input_w)),
+            f16(sample_or_zero(ic, base_y + 2, base_x + 1, input_h, input_w)),
+        );
+        let weight0_vec1 = vec4<f16>(
+            weight_buffer.data[wbase0 + 4u],
+            weight_buffer.data[wbase0 + 5u],
+            weight_buffer.data[wbase0 + 6u],
+            weight_buffer.data[wbase0 + 7u],
+        );
+        let input_scalar =
+            f16(sample_or_zero(ic, base_y + 2, base_x + 2, input_h, input_w));
+        acc0 = acc0 + dot4_f16(input_vec0, weight0_vec0);
+        acc0 = acc0 + dot4_f16(input_vec1, weight0_vec1);
+        acc0 = acc0 + input_scalar * weight_buffer.data[wbase0 + 8u];
+        if (has_oc1) {
+            let weight1_vec0 = vec4<f16>(
+                weight_buffer.data[wbase1],
+                weight_buffer.data[wbase1 + 1u],
+                weight_buffer.data[wbase1 + 2u],
+                weight_buffer.data[wbase1 + 3u],
+            );
+            let weight1_vec1 = vec4<f16>(
+                weight_buffer.data[wbase1 + 4u],
+                weight_buffer.data[wbase1 + 5u],
+                weight_buffer.data[wbase1 + 6u],
+                weight_buffer.data[wbase1 + 7u],
+            );
+            acc1 = acc1 + dot4_f16(input_vec0, weight1_vec0);
+            acc1 = acc1 + dot4_f16(input_vec1, weight1_vec1);
+            acc1 = acc1 + input_scalar * weight_buffer.data[wbase1 + 8u];
+        }
+    }
+
+    let acc0_32 = f32(acc0);
+    let output_index0 = ((oc0 * output_h + oy) * output_w) + ox;
+    output_buffer.data[output_index0] = acc0_32 / (1.0 + exp(-acc0_32));
+    if (has_oc1) {
+        let acc1_32 = f32(acc1);
+        let output_index1 = ((oc1 * output_h + oy) * output_w) + ox;
+        output_buffer.data[output_index1] = acc1_32 / (1.0 + exp(-acc1_32));
+    }
 }
 "#;
 
@@ -1107,7 +1648,14 @@ pub fn run_demo_decode(
     decode: &YoloxDecodeDemo,
     device_index: usize,
 ) -> Result<DecodedPredictions> {
-    GpuDecodeSession::new(device_index)?.run_decode(input, input_shape, backbone, pafpn, head, decode)
+    GpuDecodeSession::new(device_index)?.run_decode(
+        input,
+        input_shape,
+        backbone,
+        pafpn,
+        head,
+        decode,
+    )
 }
 
 pub fn run_demo_decode_resident(
@@ -1117,10 +1665,14 @@ pub fn run_demo_decode_resident(
     pafpn: &YoloxPafpnDemo,
     head: &YoloxHeadDemo,
     decode: &YoloxDecodeDemo,
+    fp16: bool,
     device_index: usize,
 ) -> Result<DecodedPredictions> {
-    GpuResidentDecodeSession::new(backbone, pafpn, head, device_index)?
-        .run_decode(input, input_shape, decode)
+    GpuResidentDecodeSession::new(backbone, pafpn, head, fp16, device_index)?.run_decode(
+        input,
+        input_shape,
+        decode,
+    )
 }
 
 #[derive(Clone)]
@@ -1131,8 +1683,24 @@ struct GpuTensor {
 
 struct GpuFusedConv2dWeights {
     spec: Conv2dSpec,
-    weights: Subbuffer<[f32]>,
+    weights_f32: Option<Subbuffer<[f32]>>,
+    weights_f16: Option<Subbuffer<[u16]>>,
     bias: Subbuffer<[f32]>,
+    use_fp16: bool,
+}
+
+impl GpuFusedConv2dWeights {
+    fn weights_f32(&self) -> Result<Subbuffer<[f32]>> {
+        self.weights_f32
+            .clone()
+            .ok_or_else(|| anyhow!("pesos f32 não disponíveis para este kernel"))
+    }
+
+    fn weights_f16(&self) -> Result<Subbuffer<[u16]>> {
+        self.weights_f16
+            .clone()
+            .ok_or_else(|| anyhow!("pesos fp16 não disponíveis para este kernel"))
+    }
 }
 
 struct GpuDarknetFeatures {
@@ -1227,11 +1795,7 @@ impl GpuDecodeSession {
         self.runtime.recycle_matrix(decoded)?;
 
         Ok((
-            DecodedPredictions {
-                rows,
-                cols,
-                data,
-            },
+            DecodedPredictions { rows, cols, data },
             GpuDecodeStageDurations {
                 upload,
                 backbone: backbone_time,
@@ -1295,11 +1859,7 @@ impl GpuDecodeSession {
         self.runtime.recycle_matrix(decoded)?;
 
         Ok((
-            DecodedPredictions {
-                rows,
-                cols,
-                data,
-            },
+            DecodedPredictions { rows, cols, data },
             GpuDecodeStageDurations {
                 upload,
                 backbone: backbone_time,
@@ -1317,9 +1877,10 @@ impl GpuResidentDecodeSession {
         backbone: &CspDarknetDemo,
         pafpn: &YoloxPafpnDemo,
         head: &YoloxHeadDemo,
+        fp16: bool,
         device_index: usize,
     ) -> Result<Self> {
-        let runtime = VulkanRuntime::new(device_index)?;
+        let runtime = VulkanRuntime::new_with_options(device_index, fp16)?;
         Ok(Self {
             backbone: runtime.prepare_backbone(backbone)?,
             pafpn: runtime.prepare_pafpn(pafpn)?,
@@ -1384,11 +1945,7 @@ impl GpuResidentDecodeSession {
         self.runtime.recycle_matrix(decoded)?;
 
         Ok((
-            DecodedPredictions {
-                rows,
-                cols,
-                data,
-            },
+            DecodedPredictions { rows, cols, data },
             GpuDecodeStageDurations {
                 upload,
                 backbone: backbone_time,
@@ -1451,11 +2008,7 @@ impl GpuResidentDecodeSession {
         self.runtime.recycle_matrix(decoded)?;
 
         Ok((
-            DecodedPredictions {
-                rows,
-                cols,
-                data,
-            },
+            DecodedPredictions { rows, cols, data },
             GpuDecodeStageDurations {
                 upload,
                 backbone: backbone_time,
@@ -1504,6 +2057,53 @@ pub fn query_vulkan_device_info(device_index: usize) -> Result<VulkanDeviceInfo>
         driver_name: properties.driver_name.clone(),
         driver_info: properties.driver_info.clone(),
         driver_id: properties.driver_id.map(|item| format!("{item:?}")),
+    })
+}
+
+pub fn query_vulkan_fp16_support(device_index: usize) -> Result<VulkanFp16SupportInfo> {
+    let library = load_vulkan_library()?;
+    let instance = Instance::new(
+        library,
+        InstanceCreateInfo {
+            flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+            max_api_version: Some(Version::V1_0),
+            enabled_extensions: InstanceExtensions {
+                khr_get_physical_device_properties2: true,
+                ..InstanceExtensions::empty()
+            },
+            ..Default::default()
+        },
+    )
+    .context("falha ao criar instância Vulkan para coletar suporte fp16")?;
+
+    let physical_devices = instance
+        .enumerate_physical_devices()
+        .context("falha ao enumerar GPUs Vulkan para coletar suporte fp16")?
+        .collect::<Vec<_>>();
+    let physical_device = physical_devices
+        .get(device_index)
+        .cloned()
+        .ok_or_else(|| anyhow!("device_index {} inválido", device_index))?;
+    let properties = physical_device.properties();
+    let features = physical_device.supported_features();
+    let extensions = physical_device.supported_extensions();
+
+    Ok(VulkanFp16SupportInfo {
+        device_name: properties.device_name.clone(),
+        api_version: properties.api_version.to_string(),
+        driver_name: properties.driver_name.clone(),
+        driver_info: properties.driver_info.clone(),
+        extension_khr_shader_float16_int8: extensions.khr_shader_float16_int8,
+        shader_float16: features.shader_float16,
+        storage_buffer16_bit_access: features.storage_buffer16_bit_access,
+        uniform_and_storage_buffer16_bit_access: features.uniform_and_storage_buffer16_bit_access,
+        storage_input_output16: features.storage_input_output16,
+        workgroup_memory_explicit_layout16_bit_access: features
+            .workgroup_memory_explicit_layout16_bit_access,
+        shader_denorm_flush_to_zero_float16: properties.shader_denorm_flush_to_zero_float16,
+        shader_denorm_preserve_float16: properties.shader_denorm_preserve_float16,
+        shader_rounding_mode_rte_float16: properties.shader_rounding_mode_rte_float16,
+        shader_rounding_mode_rtz_float16: properties.shader_rounding_mode_rtz_float16,
     })
 }
 
@@ -1625,6 +2225,24 @@ pub struct GpuDecodeStageDurations {
     pub readback: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct VulkanFp16SupportInfo {
+    pub device_name: String,
+    pub api_version: String,
+    pub driver_name: Option<String>,
+    pub driver_info: Option<String>,
+    pub extension_khr_shader_float16_int8: bool,
+    pub shader_float16: bool,
+    pub storage_buffer16_bit_access: bool,
+    pub uniform_and_storage_buffer16_bit_access: bool,
+    pub storage_input_output16: bool,
+    pub workgroup_memory_explicit_layout16_bit_access: bool,
+    pub shader_denorm_flush_to_zero_float16: Option<bool>,
+    pub shader_denorm_preserve_float16: Option<bool>,
+    pub shader_rounding_mode_rte_float16: Option<bool>,
+    pub shader_rounding_mode_rtz_float16: Option<bool>,
+}
+
 struct VulkanRuntime {
     device: Arc<Device>,
     queue: Arc<Queue>,
@@ -1634,10 +2252,15 @@ struct VulkanRuntime {
     pipeline_cache: Mutex<HashMap<String, Arc<ComputePipeline>>>,
     submission_future: Mutex<Option<Box<dyn GpuFuture>>>,
     temp_buffer_pool: Mutex<HashMap<usize, Vec<Subbuffer<[f32]>>>>,
+    enable_fp16: bool,
 }
 
 impl VulkanRuntime {
     fn new(device_index: usize) -> Result<Self> {
+        Self::new_with_options(device_index, false)
+    }
+
+    fn new_with_options(device_index: usize, enable_fp16: bool) -> Result<Self> {
         let library = load_vulkan_library()?;
         let instance = Instance::new(
             library,
@@ -1665,17 +2288,39 @@ impl VulkanRuntime {
             .ok_or_else(|| anyhow!("nenhuma queue family com suporte a compute foi encontrada"))?;
 
         let supported_extensions = physical_device.supported_extensions();
+        let supported_features = physical_device.supported_features();
         let device_extensions = DeviceExtensions {
             khr_portability_subset: supported_extensions.khr_portability_subset,
             khr_storage_buffer_storage_class: supported_extensions.khr_storage_buffer_storage_class,
             khr_maintenance3: supported_extensions.khr_maintenance3,
+            khr_16bit_storage: enable_fp16 && supported_extensions.khr_16bit_storage,
+            khr_shader_float16_int8: enable_fp16 && supported_extensions.khr_shader_float16_int8,
             ..DeviceExtensions::empty()
+        };
+        let enabled_features = if enable_fp16 {
+            if !supported_features.shader_float16
+                || !supported_features.storage_buffer16_bit_access
+                || !supported_features.uniform_and_storage_buffer16_bit_access
+            {
+                bail!("dispositivo Vulkan sem suporte suficiente para --fp16 experimental");
+            }
+
+            vulkano::device::DeviceFeatures {
+                shader_float16: true,
+                storage_buffer16_bit_access: true,
+                uniform_and_storage_buffer16_bit_access: true,
+                storage_input_output16: supported_features.storage_input_output16,
+                ..Default::default()
+            }
+        } else {
+            Default::default()
         };
 
         let (device, mut queues) = Device::new(
             physical_device,
             DeviceCreateInfo {
                 enabled_extensions: device_extensions,
+                enabled_features,
                 queue_create_infos: vec![QueueCreateInfo {
                     queue_family_index,
                     ..Default::default()
@@ -1701,6 +2346,7 @@ impl VulkanRuntime {
             pipeline_cache: Mutex::new(HashMap::new()),
             submission_future: Mutex::new(Some(vk_sync::now(device.clone()).boxed())),
             temp_buffer_pool: Mutex::new(HashMap::new()),
+            enable_fp16,
         })
     }
 
@@ -1746,10 +2392,30 @@ impl VulkanRuntime {
         &self,
         weights: &FusedConv2dWeights,
     ) -> Result<GpuFusedConv2dWeights> {
+        let weights_f16 = if self.enable_fp16 {
+            Some(
+                self.upload_device_buffer(
+                    &weights
+                        .weights
+                        .iter()
+                        .map(|item| f16::from_f32(*item).to_bits())
+                        .collect::<Vec<_>>(),
+                    BufferUsage::STORAGE_BUFFER,
+                )?,
+            )
+        } else {
+            None
+        };
         Ok(GpuFusedConv2dWeights {
             spec: weights.spec,
-            weights: self.upload_device_buffer(&weights.weights, BufferUsage::STORAGE_BUFFER)?,
+            weights_f32: if self.enable_fp16 {
+                None
+            } else {
+                Some(self.upload_device_buffer(&weights.weights, BufferUsage::STORAGE_BUFFER)?)
+            },
+            weights_f16,
             bias: self.upload_device_buffer(&weights.bias, BufferUsage::STORAGE_BUFFER)?,
+            use_fp16: self.enable_fp16,
         })
     }
 
@@ -1910,6 +2576,15 @@ impl VulkanRuntime {
         input: &GpuTensor,
         weights: &GpuFusedConv2dWeights,
     ) -> Result<GpuTensor> {
+        if weights.use_fp16 {
+            if Self::supports_1x1_fast_path(weights) {
+                return self.run_conv2d_silu_1x1_prepared_fp16(input, weights);
+            }
+            if Self::supports_3x3_fast_path(weights) {
+                return self.run_conv2d_silu_3x3_prepared_fp16(input, weights);
+            }
+            return self.run_conv2d_silu_prepared_fp16(input, weights);
+        }
         if Self::supports_depthwise_3x3_fast_path(weights) {
             return self.run_depthwise_conv2d_silu_3x3_prepared(input, weights);
         }
@@ -1949,14 +2624,15 @@ impl VulkanRuntime {
             output_h as u32,
             output_w as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(CONV2D_SILU_WGSL, "conv2d-silu")?;
         let descriptor_set = self.create_descriptor_set(
             &pipeline,
             [
                 WriteDescriptorSet::buffer(0, input.buffer.clone()),
-                WriteDescriptorSet::buffer(1, weights.weights.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f32()?),
                 WriteDescriptorSet::buffer(2, weights.bias.clone()),
                 WriteDescriptorSet::buffer(3, output_buffer.clone()),
                 WriteDescriptorSet::buffer(4, params_buffer),
@@ -1972,6 +2648,74 @@ impl VulkanRuntime {
                 output_shape.channels as u32,
             ],
             "conv2d-silu",
+        )?;
+
+        Ok(GpuTensor {
+            shape: output_shape,
+            buffer: output_buffer,
+        })
+    }
+
+    fn run_conv2d_silu_prepared_fp16(
+        &self,
+        input: &GpuTensor,
+        weights: &GpuFusedConv2dWeights,
+    ) -> Result<GpuTensor> {
+        if input.shape.channels != weights.spec.in_channels {
+            bail!(
+                "conv2d incompatível: input C={} pesos C={}",
+                input.shape.channels,
+                weights.spec.in_channels
+            );
+        }
+
+        let (output_h, output_w) = weights
+            .spec
+            .output_hw(input.shape.height, input.shape.width)?;
+        let output_shape = TensorShape::new(weights.spec.out_channels, output_h, output_w);
+        let output_buffer =
+            self.create_temp_buffer_f32(output_shape.len(), BufferUsage::STORAGE_BUFFER)?;
+        let params = [
+            weights.spec.in_channels as u32,
+            weights.spec.out_channels as u32,
+            input.shape.height as u32,
+            input.shape.width as u32,
+            weights.spec.kernel_h as u32,
+            weights.spec.kernel_w as u32,
+            weights.spec.stride_h as u32,
+            weights.spec.stride_w as u32,
+            weights.spec.pad_h as u32,
+            weights.spec.pad_w as u32,
+            weights.spec.groups as u32,
+            weights.spec.in_channels_per_group() as u32,
+            output_h as u32,
+            output_w as u32,
+        ];
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+
+        let pipeline =
+            self.create_pipeline(CONV2D_SILU_FP16_WEIGHTS_WGSL, "conv2d-silu-fp16-weights")?;
+        let descriptor_set = self.create_descriptor_set(
+            &pipeline,
+            [
+                WriteDescriptorSet::buffer(0, input.buffer.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f16()?),
+                WriteDescriptorSet::buffer(2, weights.bias.clone()),
+                WriteDescriptorSet::buffer(3, output_buffer.clone()),
+                WriteDescriptorSet::buffer(4, params_buffer),
+            ],
+        )?;
+
+        self.execute_compute(
+            pipeline,
+            descriptor_set,
+            [
+                (output_w as u32).div_ceil(IMAGE_LOCAL_SIZE_X),
+                (output_h as u32).div_ceil(IMAGE_LOCAL_SIZE_Y),
+                output_shape.channels as u32,
+            ],
+            "conv2d-silu-fp16-weights",
         )?;
 
         Ok(GpuTensor {
@@ -2015,14 +2759,15 @@ impl VulkanRuntime {
             output_h as u32,
             output_w as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(CONV2D_1X1_SILU_WGSL, "conv2d-1x1-silu")?;
         let descriptor_set = self.create_descriptor_set(
             &pipeline,
             [
                 WriteDescriptorSet::buffer(0, input.buffer.clone()),
-                WriteDescriptorSet::buffer(1, weights.weights.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f32()?),
                 WriteDescriptorSet::buffer(2, weights.bias.clone()),
                 WriteDescriptorSet::buffer(3, output_buffer.clone()),
                 WriteDescriptorSet::buffer(4, params_buffer),
@@ -2038,6 +2783,74 @@ impl VulkanRuntime {
                 output_shape.channels as u32,
             ],
             "conv2d-1x1-silu",
+        )?;
+
+        Ok(GpuTensor {
+            shape: output_shape,
+            buffer: output_buffer,
+        })
+    }
+
+    fn run_conv2d_silu_1x1_prepared_fp16(
+        &self,
+        input: &GpuTensor,
+        weights: &GpuFusedConv2dWeights,
+    ) -> Result<GpuTensor> {
+        if input.shape.channels != weights.spec.in_channels {
+            bail!(
+                "conv2d incompatível: input C={} pesos C={}",
+                input.shape.channels,
+                weights.spec.in_channels
+            );
+        }
+
+        let (output_h, output_w) = weights
+            .spec
+            .output_hw(input.shape.height, input.shape.width)?;
+        let output_shape = TensorShape::new(weights.spec.out_channels, output_h, output_w);
+        let output_buffer =
+            self.create_temp_buffer_f32(output_shape.len(), BufferUsage::STORAGE_BUFFER)?;
+        let params = [
+            weights.spec.in_channels as u32,
+            weights.spec.out_channels as u32,
+            input.shape.height as u32,
+            input.shape.width as u32,
+            weights.spec.kernel_h as u32,
+            weights.spec.kernel_w as u32,
+            weights.spec.stride_h as u32,
+            weights.spec.stride_w as u32,
+            weights.spec.pad_h as u32,
+            weights.spec.pad_w as u32,
+            weights.spec.groups as u32,
+            weights.spec.in_channels_per_group() as u32,
+            output_h as u32,
+            output_w as u32,
+        ];
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+
+        let pipeline =
+            self.create_pipeline(CONV2D_1X1_SILU_FP16_WEIGHTS_WGSL, "conv2d-1x1-silu-fp16")?;
+        let descriptor_set = self.create_descriptor_set(
+            &pipeline,
+            [
+                WriteDescriptorSet::buffer(0, input.buffer.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f16()?),
+                WriteDescriptorSet::buffer(2, weights.bias.clone()),
+                WriteDescriptorSet::buffer(3, output_buffer.clone()),
+                WriteDescriptorSet::buffer(4, params_buffer),
+            ],
+        )?;
+
+        self.execute_compute(
+            pipeline,
+            descriptor_set,
+            [
+                (output_w as u32).div_ceil(IMAGE_LOCAL_SIZE_X),
+                (output_h as u32).div_ceil(IMAGE_LOCAL_SIZE_Y),
+                output_shape.channels as u32,
+            ],
+            "conv2d-1x1-silu-fp16",
         )?;
 
         Ok(GpuTensor {
@@ -2081,14 +2894,15 @@ impl VulkanRuntime {
             output_h as u32,
             output_w as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(CONV2D_3X3_SILU_WGSL, "conv2d-3x3-silu")?;
         let descriptor_set = self.create_descriptor_set(
             &pipeline,
             [
                 WriteDescriptorSet::buffer(0, input.buffer.clone()),
-                WriteDescriptorSet::buffer(1, weights.weights.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f32()?),
                 WriteDescriptorSet::buffer(2, weights.bias.clone()),
                 WriteDescriptorSet::buffer(3, output_buffer.clone()),
                 WriteDescriptorSet::buffer(4, params_buffer),
@@ -2104,6 +2918,75 @@ impl VulkanRuntime {
                 output_shape.channels as u32,
             ],
             "conv2d-3x3-silu",
+        )?;
+
+        Ok(GpuTensor {
+            shape: output_shape,
+            buffer: output_buffer,
+        })
+    }
+
+    fn run_conv2d_silu_3x3_prepared_fp16(
+        &self,
+        input: &GpuTensor,
+        weights: &GpuFusedConv2dWeights,
+    ) -> Result<GpuTensor> {
+        if input.shape.channels != weights.spec.in_channels {
+            bail!(
+                "conv2d incompatível: input C={} pesos C={}",
+                input.shape.channels,
+                weights.spec.in_channels
+            );
+        }
+
+        let (output_h, output_w) = weights
+            .spec
+            .output_hw(input.shape.height, input.shape.width)?;
+        let output_shape = TensorShape::new(weights.spec.out_channels, output_h, output_w);
+        let output_buffer =
+            self.create_temp_buffer_f32(output_shape.len(), BufferUsage::STORAGE_BUFFER)?;
+        let params = [
+            weights.spec.in_channels as u32,
+            weights.spec.out_channels as u32,
+            input.shape.height as u32,
+            input.shape.width as u32,
+            weights.spec.kernel_h as u32,
+            weights.spec.kernel_w as u32,
+            weights.spec.stride_h as u32,
+            weights.spec.stride_w as u32,
+            weights.spec.pad_h as u32,
+            weights.spec.pad_w as u32,
+            weights.spec.groups as u32,
+            weights.spec.in_channels_per_group() as u32,
+            output_h as u32,
+            output_w as u32,
+        ];
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+
+        let pipeline =
+            self.create_pipeline(CONV2D_3X3_SILU_FP16_WEIGHTS_WGSL, "conv2d-3x3-silu-fp16")?;
+        let descriptor_set = self.create_descriptor_set(
+            &pipeline,
+            [
+                WriteDescriptorSet::buffer(0, input.buffer.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f16()?),
+                WriteDescriptorSet::buffer(2, weights.bias.clone()),
+                WriteDescriptorSet::buffer(3, output_buffer.clone()),
+                WriteDescriptorSet::buffer(4, params_buffer),
+            ],
+        )?;
+
+        self.execute_compute(
+            pipeline,
+            descriptor_set,
+            [
+                (output_w as u32).div_ceil(FP16_CONV3X3_LOCAL_SIZE_X),
+                (output_h as u32).div_ceil(FP16_CONV3X3_LOCAL_SIZE_Y),
+                (output_shape.channels as u32)
+                    .div_ceil(FP16_CONV3X3_OUTPUT_CHANNELS_PER_INVOCATION),
+            ],
+            "conv2d-3x3-silu-fp16",
         )?;
 
         Ok(GpuTensor {
@@ -2147,7 +3030,8 @@ impl VulkanRuntime {
             output_h as u32,
             output_w as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline =
             self.create_pipeline(DEPTHWISE_CONV2D_3X3_SILU_WGSL, "depthwise-conv2d-3x3-silu")?;
@@ -2155,7 +3039,7 @@ impl VulkanRuntime {
             &pipeline,
             [
                 WriteDescriptorSet::buffer(0, input.buffer.clone()),
-                WriteDescriptorSet::buffer(1, weights.weights.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f32()?),
                 WriteDescriptorSet::buffer(2, weights.bias.clone()),
                 WriteDescriptorSet::buffer(3, output_buffer.clone()),
                 WriteDescriptorSet::buffer(4, params_buffer),
@@ -2184,6 +3068,15 @@ impl VulkanRuntime {
         input: &GpuTensor,
         weights: &GpuFusedConv2dWeights,
     ) -> Result<GpuTensor> {
+        if weights.use_fp16 {
+            if Self::supports_1x1_fast_path(weights) {
+                return self.run_conv2d_1x1_prepared_fp16(input, weights);
+            }
+            if Self::supports_3x3_fast_path(weights) {
+                return self.run_conv2d_3x3_prepared_fp16(input, weights);
+            }
+            return self.run_conv2d_prepared_fp16(input, weights);
+        }
         if Self::supports_depthwise_3x3_fast_path(weights) {
             return self.run_depthwise_conv2d_3x3_prepared(input, weights);
         }
@@ -2223,14 +3116,15 @@ impl VulkanRuntime {
             output_h as u32,
             output_w as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(CONV2D_WGSL, "conv2d")?;
         let descriptor_set = self.create_descriptor_set(
             &pipeline,
             [
                 WriteDescriptorSet::buffer(0, input.buffer.clone()),
-                WriteDescriptorSet::buffer(1, weights.weights.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f32()?),
                 WriteDescriptorSet::buffer(2, weights.bias.clone()),
                 WriteDescriptorSet::buffer(3, output_buffer.clone()),
                 WriteDescriptorSet::buffer(4, params_buffer),
@@ -2246,6 +3140,73 @@ impl VulkanRuntime {
                 output_shape.channels as u32,
             ],
             "conv2d",
+        )?;
+
+        Ok(GpuTensor {
+            shape: output_shape,
+            buffer: output_buffer,
+        })
+    }
+
+    fn run_conv2d_prepared_fp16(
+        &self,
+        input: &GpuTensor,
+        weights: &GpuFusedConv2dWeights,
+    ) -> Result<GpuTensor> {
+        if input.shape.channels != weights.spec.in_channels {
+            bail!(
+                "conv2d incompatível: input C={} pesos C={}",
+                input.shape.channels,
+                weights.spec.in_channels
+            );
+        }
+
+        let (output_h, output_w) = weights
+            .spec
+            .output_hw(input.shape.height, input.shape.width)?;
+        let output_shape = TensorShape::new(weights.spec.out_channels, output_h, output_w);
+        let output_buffer =
+            self.create_temp_buffer_f32(output_shape.len(), BufferUsage::STORAGE_BUFFER)?;
+        let params = [
+            weights.spec.in_channels as u32,
+            weights.spec.out_channels as u32,
+            input.shape.height as u32,
+            input.shape.width as u32,
+            weights.spec.kernel_h as u32,
+            weights.spec.kernel_w as u32,
+            weights.spec.stride_h as u32,
+            weights.spec.stride_w as u32,
+            weights.spec.pad_h as u32,
+            weights.spec.pad_w as u32,
+            weights.spec.groups as u32,
+            weights.spec.in_channels_per_group() as u32,
+            output_h as u32,
+            output_w as u32,
+        ];
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+
+        let pipeline = self.create_pipeline(CONV2D_FP16_WEIGHTS_WGSL, "conv2d-fp16-weights")?;
+        let descriptor_set = self.create_descriptor_set(
+            &pipeline,
+            [
+                WriteDescriptorSet::buffer(0, input.buffer.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f16()?),
+                WriteDescriptorSet::buffer(2, weights.bias.clone()),
+                WriteDescriptorSet::buffer(3, output_buffer.clone()),
+                WriteDescriptorSet::buffer(4, params_buffer),
+            ],
+        )?;
+
+        self.execute_compute(
+            pipeline,
+            descriptor_set,
+            [
+                (output_w as u32).div_ceil(IMAGE_LOCAL_SIZE_X),
+                (output_h as u32).div_ceil(IMAGE_LOCAL_SIZE_Y),
+                output_shape.channels as u32,
+            ],
+            "conv2d-fp16-weights",
         )?;
 
         Ok(GpuTensor {
@@ -2289,14 +3250,15 @@ impl VulkanRuntime {
             output_h as u32,
             output_w as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(CONV2D_1X1_WGSL, "conv2d-1x1")?;
         let descriptor_set = self.create_descriptor_set(
             &pipeline,
             [
                 WriteDescriptorSet::buffer(0, input.buffer.clone()),
-                WriteDescriptorSet::buffer(1, weights.weights.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f32()?),
                 WriteDescriptorSet::buffer(2, weights.bias.clone()),
                 WriteDescriptorSet::buffer(3, output_buffer.clone()),
                 WriteDescriptorSet::buffer(4, params_buffer),
@@ -2312,6 +3274,73 @@ impl VulkanRuntime {
                 output_shape.channels as u32,
             ],
             "conv2d-1x1",
+        )?;
+
+        Ok(GpuTensor {
+            shape: output_shape,
+            buffer: output_buffer,
+        })
+    }
+
+    fn run_conv2d_1x1_prepared_fp16(
+        &self,
+        input: &GpuTensor,
+        weights: &GpuFusedConv2dWeights,
+    ) -> Result<GpuTensor> {
+        if input.shape.channels != weights.spec.in_channels {
+            bail!(
+                "conv2d incompatível: input C={} pesos C={}",
+                input.shape.channels,
+                weights.spec.in_channels
+            );
+        }
+
+        let (output_h, output_w) = weights
+            .spec
+            .output_hw(input.shape.height, input.shape.width)?;
+        let output_shape = TensorShape::new(weights.spec.out_channels, output_h, output_w);
+        let output_buffer =
+            self.create_temp_buffer_f32(output_shape.len(), BufferUsage::STORAGE_BUFFER)?;
+        let params = [
+            weights.spec.in_channels as u32,
+            weights.spec.out_channels as u32,
+            input.shape.height as u32,
+            input.shape.width as u32,
+            weights.spec.kernel_h as u32,
+            weights.spec.kernel_w as u32,
+            weights.spec.stride_h as u32,
+            weights.spec.stride_w as u32,
+            weights.spec.pad_h as u32,
+            weights.spec.pad_w as u32,
+            weights.spec.groups as u32,
+            weights.spec.in_channels_per_group() as u32,
+            output_h as u32,
+            output_w as u32,
+        ];
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+
+        let pipeline = self.create_pipeline(CONV2D_1X1_FP16_WEIGHTS_WGSL, "conv2d-1x1-fp16")?;
+        let descriptor_set = self.create_descriptor_set(
+            &pipeline,
+            [
+                WriteDescriptorSet::buffer(0, input.buffer.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f16()?),
+                WriteDescriptorSet::buffer(2, weights.bias.clone()),
+                WriteDescriptorSet::buffer(3, output_buffer.clone()),
+                WriteDescriptorSet::buffer(4, params_buffer),
+            ],
+        )?;
+
+        self.execute_compute(
+            pipeline,
+            descriptor_set,
+            [
+                (output_w as u32).div_ceil(IMAGE_LOCAL_SIZE_X),
+                (output_h as u32).div_ceil(IMAGE_LOCAL_SIZE_Y),
+                output_shape.channels as u32,
+            ],
+            "conv2d-1x1-fp16",
         )?;
 
         Ok(GpuTensor {
@@ -2355,14 +3384,15 @@ impl VulkanRuntime {
             output_h as u32,
             output_w as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(CONV2D_3X3_WGSL, "conv2d-3x3")?;
         let descriptor_set = self.create_descriptor_set(
             &pipeline,
             [
                 WriteDescriptorSet::buffer(0, input.buffer.clone()),
-                WriteDescriptorSet::buffer(1, weights.weights.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f32()?),
                 WriteDescriptorSet::buffer(2, weights.bias.clone()),
                 WriteDescriptorSet::buffer(3, output_buffer.clone()),
                 WriteDescriptorSet::buffer(4, params_buffer),
@@ -2378,6 +3408,74 @@ impl VulkanRuntime {
                 output_shape.channels as u32,
             ],
             "conv2d-3x3",
+        )?;
+
+        Ok(GpuTensor {
+            shape: output_shape,
+            buffer: output_buffer,
+        })
+    }
+
+    fn run_conv2d_3x3_prepared_fp16(
+        &self,
+        input: &GpuTensor,
+        weights: &GpuFusedConv2dWeights,
+    ) -> Result<GpuTensor> {
+        if input.shape.channels != weights.spec.in_channels {
+            bail!(
+                "conv2d incompatível: input C={} pesos C={}",
+                input.shape.channels,
+                weights.spec.in_channels
+            );
+        }
+
+        let (output_h, output_w) = weights
+            .spec
+            .output_hw(input.shape.height, input.shape.width)?;
+        let output_shape = TensorShape::new(weights.spec.out_channels, output_h, output_w);
+        let output_buffer =
+            self.create_temp_buffer_f32(output_shape.len(), BufferUsage::STORAGE_BUFFER)?;
+        let params = [
+            weights.spec.in_channels as u32,
+            weights.spec.out_channels as u32,
+            input.shape.height as u32,
+            input.shape.width as u32,
+            weights.spec.kernel_h as u32,
+            weights.spec.kernel_w as u32,
+            weights.spec.stride_h as u32,
+            weights.spec.stride_w as u32,
+            weights.spec.pad_h as u32,
+            weights.spec.pad_w as u32,
+            weights.spec.groups as u32,
+            weights.spec.in_channels_per_group() as u32,
+            output_h as u32,
+            output_w as u32,
+        ];
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+
+        let pipeline = self.create_pipeline(CONV2D_3X3_FP16_WEIGHTS_WGSL, "conv2d-3x3-fp16")?;
+        let descriptor_set = self.create_descriptor_set(
+            &pipeline,
+            [
+                WriteDescriptorSet::buffer(0, input.buffer.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f16()?),
+                WriteDescriptorSet::buffer(2, weights.bias.clone()),
+                WriteDescriptorSet::buffer(3, output_buffer.clone()),
+                WriteDescriptorSet::buffer(4, params_buffer),
+            ],
+        )?;
+
+        self.execute_compute(
+            pipeline,
+            descriptor_set,
+            [
+                (output_w as u32).div_ceil(FP16_CONV3X3_LOCAL_SIZE_X),
+                (output_h as u32).div_ceil(FP16_CONV3X3_LOCAL_SIZE_Y),
+                (output_shape.channels as u32)
+                    .div_ceil(FP16_CONV3X3_OUTPUT_CHANNELS_PER_INVOCATION),
+            ],
+            "conv2d-3x3-fp16",
         )?;
 
         Ok(GpuTensor {
@@ -2421,14 +3519,15 @@ impl VulkanRuntime {
             output_h as u32,
             output_w as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(DEPTHWISE_CONV2D_3X3_WGSL, "depthwise-conv2d-3x3")?;
         let descriptor_set = self.create_descriptor_set(
             &pipeline,
             [
                 WriteDescriptorSet::buffer(0, input.buffer.clone()),
-                WriteDescriptorSet::buffer(1, weights.weights.clone()),
+                WriteDescriptorSet::buffer(1, weights.weights_f32()?),
                 WriteDescriptorSet::buffer(2, weights.bias.clone()),
                 WriteDescriptorSet::buffer(3, output_buffer.clone()),
                 WriteDescriptorSet::buffer(4, params_buffer),
@@ -2456,7 +3555,8 @@ impl VulkanRuntime {
         let output_buffer =
             self.create_temp_buffer_f32(input.shape.len(), BufferUsage::STORAGE_BUFFER)?;
         let params = [input.shape.len() as u32];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(SILU_WGSL, "silu")?;
         let descriptor_set = self.create_descriptor_set(
@@ -2505,7 +3605,8 @@ impl VulkanRuntime {
             output_shape.height as u32,
             output_shape.width as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(UPSAMPLE_NEAREST_WGSL, "upsample-nearest")?;
         let descriptor_set = self.create_descriptor_set(
@@ -2556,7 +3657,8 @@ impl VulkanRuntime {
             lhs.shape.height as u32,
             lhs.shape.width as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(CONCAT_CHANNELS_WGSL, "concat-channels")?;
         let descriptor_set = self.create_descriptor_set(
@@ -2590,7 +3692,8 @@ impl VulkanRuntime {
         let output_buffer =
             self.create_temp_buffer_f32(input.shape.len(), BufferUsage::STORAGE_BUFFER)?;
         let params = [input.shape.len() as u32];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(SIGMOID_WGSL, "sigmoid")?;
         let descriptor_set = self.create_descriptor_set(
@@ -2631,7 +3734,8 @@ impl VulkanRuntime {
         let output_buffer =
             self.create_temp_buffer_f32(lhs.shape.len(), BufferUsage::STORAGE_BUFFER)?;
         let params = [lhs.shape.len() as u32];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(ADD_WGSL, "add")?;
         let descriptor_set = self.create_descriptor_set(
@@ -2690,7 +3794,8 @@ impl VulkanRuntime {
             output_shape.height as u32,
             output_shape.width as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(MAXPOOL2D_WGSL, "maxpool2d")?;
         let descriptor_set = self.create_descriptor_set(
@@ -2752,7 +3857,8 @@ impl VulkanRuntime {
             a.shape.height as u32,
             a.shape.width as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(CONCAT3_CHANNELS_WGSL, "concat3-channels")?;
         let descriptor_set = self.create_descriptor_set(
@@ -2803,7 +3909,8 @@ impl VulkanRuntime {
             pooling[1] as u32,
             pooling[2] as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(SPP_CONCAT_WGSL, "spp-concat")?;
         let descriptor_set = self.create_descriptor_set(
@@ -2854,7 +3961,8 @@ impl VulkanRuntime {
             output_shape.height as u32,
             output_shape.width as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(FOCUS_WGSL, "focus")?;
         let descriptor_set = self.create_descriptor_set(
@@ -3227,7 +4335,8 @@ impl VulkanRuntime {
             0,
             rows as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(DECODE_HEAD_SCALE_WGSL, "decode-head-scale")?;
         let descriptor_set = self.create_descriptor_set(
@@ -3287,7 +4396,8 @@ impl VulkanRuntime {
             row_offset as u32,
             output_rows as u32,
         ];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(DECODE_HEAD_SCALE_WGSL, "decode-head-scale")?;
         let descriptor_set = self.create_descriptor_set(
@@ -3328,7 +4438,8 @@ impl VulkanRuntime {
         let output_buffer =
             self.create_temp_buffer_f32(rows * cols, BufferUsage::STORAGE_BUFFER)?;
         let params = [lhs.rows as u32, rhs.rows as u32, cols as u32];
-        let params_buffer = self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
+        let params_buffer =
+            self.upload_host_storage_buffer(&params, BufferUsage::STORAGE_BUFFER)?;
 
         let pipeline = self.create_pipeline(CONCAT_ROWS_WGSL, "concat-rows")?;
         let descriptor_set = self.create_descriptor_set(
@@ -3525,7 +4636,9 @@ impl VulkanRuntime {
         let mut future = future
             .then_signal_fence_and_flush()
             .context("falha ao flushar submissões pendentes")?;
-        let result = future.wait(None).context("falha ao aguardar submissões pendentes");
+        let result = future
+            .wait(None)
+            .context("falha ao aguardar submissões pendentes");
         future.cleanup_finished();
         self.reset_submission_future()?;
         result
@@ -3664,8 +4777,7 @@ impl VulkanRuntime {
             }
         }
 
-        Err(last_error.unwrap())
-            .context("falha ao criar buffer de readback")
+        Err(last_error.unwrap()).context("falha ao criar buffer de readback")
     }
 
     fn upload_host_storage_buffer<
