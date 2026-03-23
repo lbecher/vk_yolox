@@ -3352,8 +3352,8 @@ impl VulkanRuntime {
         let filters = [
             MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_RANDOM_ACCESS,
             MemoryTypeFilter::HOST_RANDOM_ACCESS,
-            MemoryTypeFilter::PREFER_HOST,
-            MemoryTypeFilter::empty(),
+            MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
         ];
         let mut last_error = None;
 
