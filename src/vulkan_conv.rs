@@ -49,10 +49,10 @@ use crate::{
 
 const IMAGE_LOCAL_SIZE_X: u32 = 8;
 const IMAGE_LOCAL_SIZE_Y: u32 = 8;
-const FP16_CONV1X1_OUTPUT_CHANNELS_PER_INVOCATION: u32 = 2;
+const FP16_CONV1X1_OUTPUT_CHANNELS_PER_INVOCATION: u32 = 4;
 const FP16_CONV3X3_LOCAL_SIZE_X: u32 = 8;
 const FP16_CONV3X3_LOCAL_SIZE_Y: u32 = 8;
-const FP16_CONV3X3_OUTPUT_CHANNELS_PER_INVOCATION: u32 = 2;
+const FP16_CONV3X3_OUTPUT_CHANNELS_PER_INVOCATION: u32 = 4;
 const LINEAR_LOCAL_SIZE_X: u32 = 64;
 const MATRIX_LOCAL_SIZE_X: u32 = 16;
 const MATRIX_LOCAL_SIZE_Y: u32 = 16;
@@ -320,8 +320,10 @@ fn dot4_f16(a: vec4<f16>, b: vec4<f16>) -> f16 {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ox = gid.x;
     let oy = gid.y;
-    let oc0 = gid.z * 2u;
+    let oc0 = gid.z * 4u;
     let oc1 = oc0 + 1u;
+    let oc2 = oc0 + 2u;
+    let oc3 = oc0 + 3u;
 
     let out_channels = params_buffer.data[1];
     let input_h = params_buffer.data[2];
@@ -337,14 +339,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var acc0 = f16(bias_buffer.data[oc0]);
     var acc1 = f16(0.0);
+    var acc2 = f16(0.0);
+    var acc3 = f16(0.0);
     let out_channels_per_group = out_channels / groups;
     let group0 = oc0 / out_channels_per_group;
     let ic_start = group0 * in_channels_per_group;
     let ic_end = ic_start + in_channels_per_group;
     let has_oc1 =
         oc1 < out_channels && (oc1 / out_channels_per_group) == group0;
+    let has_oc2 =
+        oc2 < out_channels && (oc2 / out_channels_per_group) == group0;
+    let has_oc3 =
+        oc3 < out_channels && (oc3 / out_channels_per_group) == group0;
     if (has_oc1) {
         acc1 = f16(bias_buffer.data[oc1]);
+    }
+    if (has_oc2) {
+        acc2 = f16(bias_buffer.data[oc2]);
+    }
+    if (has_oc3) {
+        acc3 = f16(bias_buffer.data[oc3]);
     }
     let src_y = oy * stride_h;
     let src_x = ox * stride_w;
@@ -385,6 +399,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             );
             acc1 = acc1 + dot4_f16(input_vec, weight1_vec);
         }
+        if (has_oc2) {
+            let weight2_index = (oc2 * in_channels_per_group) + group_ic;
+            let weight2_vec = vec4<f16>(
+                weight_buffer.data[weight2_index],
+                weight_buffer.data[weight2_index + 1u],
+                weight_buffer.data[weight2_index + 2u],
+                weight_buffer.data[weight2_index + 3u],
+            );
+            acc2 = acc2 + dot4_f16(input_vec, weight2_vec);
+        }
+        if (has_oc3) {
+            let weight3_index = (oc3 * in_channels_per_group) + group_ic;
+            let weight3_vec = vec4<f16>(
+                weight_buffer.data[weight3_index],
+                weight_buffer.data[weight3_index + 1u],
+                weight_buffer.data[weight3_index + 2u],
+                weight_buffer.data[weight3_index + 3u],
+            );
+            acc3 = acc3 + dot4_f16(input_vec, weight3_vec);
+        }
         ic = ic + 4u;
     }
 
@@ -398,6 +432,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let weight1_index = (oc1 * in_channels_per_group) + group_ic;
             acc1 = acc1 + input_value * weight_buffer.data[weight1_index];
         }
+        if (has_oc2) {
+            let weight2_index = (oc2 * in_channels_per_group) + group_ic;
+            acc2 = acc2 + input_value * weight_buffer.data[weight2_index];
+        }
+        if (has_oc3) {
+            let weight3_index = (oc3 * in_channels_per_group) + group_ic;
+            acc3 = acc3 + input_value * weight_buffer.data[weight3_index];
+        }
     }
 
     let output0_index = ((oc0 * output_h + oy) * output_w) + ox;
@@ -405,6 +447,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (has_oc1) {
         let output1_index = ((oc1 * output_h + oy) * output_w) + ox;
         output_buffer.data[output1_index] = f32(acc1);
+    }
+    if (has_oc2) {
+        let output2_index = ((oc2 * output_h + oy) * output_w) + ox;
+        output_buffer.data[output2_index] = f32(acc2);
+    }
+    if (has_oc3) {
+        let output3_index = ((oc3 * output_h + oy) * output_w) + ox;
+        output_buffer.data[output3_index] = f32(acc3);
     }
 }
 "#;
@@ -431,8 +481,10 @@ fn dot4_f16(a: vec4<f16>, b: vec4<f16>) -> f16 {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ox = gid.x;
     let oy = gid.y;
-    let oc0 = gid.z * 2u;
+    let oc0 = gid.z * 4u;
     let oc1 = oc0 + 1u;
+    let oc2 = oc0 + 2u;
+    let oc3 = oc0 + 3u;
 
     let out_channels = params_buffer.data[1];
     let input_h = params_buffer.data[2];
@@ -448,14 +500,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var acc0 = f16(bias_buffer.data[oc0]);
     var acc1 = f16(0.0);
+    var acc2 = f16(0.0);
+    var acc3 = f16(0.0);
     let out_channels_per_group = out_channels / groups;
     let group0 = oc0 / out_channels_per_group;
     let ic_start = group0 * in_channels_per_group;
     let ic_end = ic_start + in_channels_per_group;
     let has_oc1 =
         oc1 < out_channels && (oc1 / out_channels_per_group) == group0;
+    let has_oc2 =
+        oc2 < out_channels && (oc2 / out_channels_per_group) == group0;
+    let has_oc3 =
+        oc3 < out_channels && (oc3 / out_channels_per_group) == group0;
     if (has_oc1) {
         acc1 = f16(bias_buffer.data[oc1]);
+    }
+    if (has_oc2) {
+        acc2 = f16(bias_buffer.data[oc2]);
+    }
+    if (has_oc3) {
+        acc3 = f16(bias_buffer.data[oc3]);
     }
     let src_y = oy * stride_h;
     let src_x = ox * stride_w;
@@ -496,6 +560,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             );
             acc1 = acc1 + dot4_f16(input_vec, weight1_vec);
         }
+        if (has_oc2) {
+            let weight2_index = (oc2 * in_channels_per_group) + group_ic;
+            let weight2_vec = vec4<f16>(
+                weight_buffer.data[weight2_index],
+                weight_buffer.data[weight2_index + 1u],
+                weight_buffer.data[weight2_index + 2u],
+                weight_buffer.data[weight2_index + 3u],
+            );
+            acc2 = acc2 + dot4_f16(input_vec, weight2_vec);
+        }
+        if (has_oc3) {
+            let weight3_index = (oc3 * in_channels_per_group) + group_ic;
+            let weight3_vec = vec4<f16>(
+                weight_buffer.data[weight3_index],
+                weight_buffer.data[weight3_index + 1u],
+                weight_buffer.data[weight3_index + 2u],
+                weight_buffer.data[weight3_index + 3u],
+            );
+            acc3 = acc3 + dot4_f16(input_vec, weight3_vec);
+        }
         ic = ic + 4u;
     }
 
@@ -509,6 +593,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let weight1_index = (oc1 * in_channels_per_group) + group_ic;
             acc1 = acc1 + input_value * weight_buffer.data[weight1_index];
         }
+        if (has_oc2) {
+            let weight2_index = (oc2 * in_channels_per_group) + group_ic;
+            acc2 = acc2 + input_value * weight_buffer.data[weight2_index];
+        }
+        if (has_oc3) {
+            let weight3_index = (oc3 * in_channels_per_group) + group_ic;
+            acc3 = acc3 + input_value * weight_buffer.data[weight3_index];
+        }
     }
 
     let acc0_32 = f32(acc0);
@@ -518,6 +610,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let acc1_32 = f32(acc1);
         let output1_index = ((oc1 * output_h + oy) * output_w) + ox;
         output_buffer.data[output1_index] = acc1_32 / (1.0 + exp(-acc1_32));
+    }
+    if (has_oc2) {
+        let acc2_32 = f32(acc2);
+        let output2_index = ((oc2 * output_h + oy) * output_w) + ox;
+        output_buffer.data[output2_index] = acc2_32 / (1.0 + exp(-acc2_32));
+    }
+    if (has_oc3) {
+        let acc3_32 = f32(acc3);
+        let output3_index = ((oc3 * output_h + oy) * output_w) + ox;
+        output_buffer.data[output3_index] = acc3_32 / (1.0 + exp(-acc3_32));
     }
 }
 "#;
@@ -781,8 +883,10 @@ fn sample_or_zero(
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ox = gid.x;
     let oy = gid.y;
-    let oc0 = gid.z * 2u;
+    let oc0 = gid.z * 4u;
     let oc1 = oc0 + 1u;
+    let oc2 = oc0 + 2u;
+    let oc3 = oc0 + 3u;
 
     let in_channels = params_buffer.data[0];
     let out_channels = params_buffer.data[1];
@@ -797,9 +901,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var acc0 = f16(bias_buffer.data[oc0]);
     var acc1 = f16(0.0);
+    var acc2 = f16(0.0);
+    var acc3 = f16(0.0);
     let has_oc1 = oc1 < out_channels;
+    let has_oc2 = oc2 < out_channels;
+    let has_oc3 = oc3 < out_channels;
     if (has_oc1) {
         acc1 = f16(bias_buffer.data[oc1]);
+    }
+    if (has_oc2) {
+        acc2 = f16(bias_buffer.data[oc2]);
+    }
+    if (has_oc3) {
+        acc3 = f16(bias_buffer.data[oc3]);
     }
     let base_y = i32(oy * stride_h) - 1;
     let base_x = i32(ox * stride_w) - 1;
@@ -807,6 +921,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var ic: u32 = 0u; ic < in_channels; ic = ic + 1u) {
         let wbase0 = (oc0 * in_channels + ic) * 9u;
         let wbase1 = (oc1 * in_channels + ic) * 9u;
+        let wbase2 = (oc2 * in_channels + ic) * 9u;
+        let wbase3 = (oc3 * in_channels + ic) * 9u;
         let input_vec0 = vec4<f16>(
             f16(sample_or_zero(ic, base_y, base_x, input_h, input_w)),
             f16(sample_or_zero(ic, base_y, base_x + 1, input_h, input_w)),
@@ -855,6 +971,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             acc1 = acc1
                 + input_scalar * weight_buffer.data[wbase1 + 8u];
         }
+        if (has_oc2) {
+            let weight2_vec0 = vec4<f16>(
+                weight_buffer.data[wbase2],
+                weight_buffer.data[wbase2 + 1u],
+                weight_buffer.data[wbase2 + 2u],
+                weight_buffer.data[wbase2 + 3u],
+            );
+            let weight2_vec1 = vec4<f16>(
+                weight_buffer.data[wbase2 + 4u],
+                weight_buffer.data[wbase2 + 5u],
+                weight_buffer.data[wbase2 + 6u],
+                weight_buffer.data[wbase2 + 7u],
+            );
+            acc2 = acc2 + dot4_f16(input_vec0, weight2_vec0);
+            acc2 = acc2 + dot4_f16(input_vec1, weight2_vec1);
+            acc2 = acc2
+                + input_scalar * weight_buffer.data[wbase2 + 8u];
+        }
+        if (has_oc3) {
+            let weight3_vec0 = vec4<f16>(
+                weight_buffer.data[wbase3],
+                weight_buffer.data[wbase3 + 1u],
+                weight_buffer.data[wbase3 + 2u],
+                weight_buffer.data[wbase3 + 3u],
+            );
+            let weight3_vec1 = vec4<f16>(
+                weight_buffer.data[wbase3 + 4u],
+                weight_buffer.data[wbase3 + 5u],
+                weight_buffer.data[wbase3 + 6u],
+                weight_buffer.data[wbase3 + 7u],
+            );
+            acc3 = acc3 + dot4_f16(input_vec0, weight3_vec0);
+            acc3 = acc3 + dot4_f16(input_vec1, weight3_vec1);
+            acc3 = acc3
+                + input_scalar * weight_buffer.data[wbase3 + 8u];
+        }
     }
 
     let output_index0 = ((oc0 * output_h + oy) * output_w) + ox;
@@ -862,6 +1014,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (has_oc1) {
         let output_index1 = ((oc1 * output_h + oy) * output_w) + ox;
         output_buffer.data[output_index1] = f32(acc1);
+    }
+    if (has_oc2) {
+        let output_index2 = ((oc2 * output_h + oy) * output_w) + ox;
+        output_buffer.data[output_index2] = f32(acc2);
+    }
+    if (has_oc3) {
+        let output_index3 = ((oc3 * output_h + oy) * output_w) + ox;
+        output_buffer.data[output_index3] = f32(acc3);
     }
 }
 "#;
@@ -902,8 +1062,10 @@ fn sample_or_zero(
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ox = gid.x;
     let oy = gid.y;
-    let oc0 = gid.z * 2u;
+    let oc0 = gid.z * 4u;
     let oc1 = oc0 + 1u;
+    let oc2 = oc0 + 2u;
+    let oc3 = oc0 + 3u;
 
     let in_channels = params_buffer.data[0];
     let out_channels = params_buffer.data[1];
@@ -918,9 +1080,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var acc0 = f16(bias_buffer.data[oc0]);
     var acc1 = f16(0.0);
+    var acc2 = f16(0.0);
+    var acc3 = f16(0.0);
     let has_oc1 = oc1 < out_channels;
+    let has_oc2 = oc2 < out_channels;
+    let has_oc3 = oc3 < out_channels;
     if (has_oc1) {
         acc1 = f16(bias_buffer.data[oc1]);
+    }
+    if (has_oc2) {
+        acc2 = f16(bias_buffer.data[oc2]);
+    }
+    if (has_oc3) {
+        acc3 = f16(bias_buffer.data[oc3]);
     }
     let base_y = i32(oy * stride_h) - 1;
     let base_x = i32(ox * stride_w) - 1;
@@ -928,6 +1100,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var ic: u32 = 0u; ic < in_channels; ic = ic + 1u) {
         let wbase0 = (oc0 * in_channels + ic) * 9u;
         let wbase1 = (oc1 * in_channels + ic) * 9u;
+        let wbase2 = (oc2 * in_channels + ic) * 9u;
+        let wbase3 = (oc3 * in_channels + ic) * 9u;
         let input_vec0 = vec4<f16>(
             f16(sample_or_zero(ic, base_y, base_x, input_h, input_w)),
             f16(sample_or_zero(ic, base_y, base_x + 1, input_h, input_w)),
@@ -974,6 +1148,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             acc1 = acc1 + dot4_f16(input_vec1, weight1_vec1);
             acc1 = acc1 + input_scalar * weight_buffer.data[wbase1 + 8u];
         }
+        if (has_oc2) {
+            let weight2_vec0 = vec4<f16>(
+                weight_buffer.data[wbase2],
+                weight_buffer.data[wbase2 + 1u],
+                weight_buffer.data[wbase2 + 2u],
+                weight_buffer.data[wbase2 + 3u],
+            );
+            let weight2_vec1 = vec4<f16>(
+                weight_buffer.data[wbase2 + 4u],
+                weight_buffer.data[wbase2 + 5u],
+                weight_buffer.data[wbase2 + 6u],
+                weight_buffer.data[wbase2 + 7u],
+            );
+            acc2 = acc2 + dot4_f16(input_vec0, weight2_vec0);
+            acc2 = acc2 + dot4_f16(input_vec1, weight2_vec1);
+            acc2 = acc2 + input_scalar * weight_buffer.data[wbase2 + 8u];
+        }
+        if (has_oc3) {
+            let weight3_vec0 = vec4<f16>(
+                weight_buffer.data[wbase3],
+                weight_buffer.data[wbase3 + 1u],
+                weight_buffer.data[wbase3 + 2u],
+                weight_buffer.data[wbase3 + 3u],
+            );
+            let weight3_vec1 = vec4<f16>(
+                weight_buffer.data[wbase3 + 4u],
+                weight_buffer.data[wbase3 + 5u],
+                weight_buffer.data[wbase3 + 6u],
+                weight_buffer.data[wbase3 + 7u],
+            );
+            acc3 = acc3 + dot4_f16(input_vec0, weight3_vec0);
+            acc3 = acc3 + dot4_f16(input_vec1, weight3_vec1);
+            acc3 = acc3 + input_scalar * weight_buffer.data[wbase3 + 8u];
+        }
     }
 
     let acc0_32 = f32(acc0);
@@ -983,6 +1191,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let acc1_32 = f32(acc1);
         let output_index1 = ((oc1 * output_h + oy) * output_w) + ox;
         output_buffer.data[output_index1] = acc1_32 / (1.0 + exp(-acc1_32));
+    }
+    if (has_oc2) {
+        let acc2_32 = f32(acc2);
+        let output_index2 = ((oc2 * output_h + oy) * output_w) + ox;
+        output_buffer.data[output_index2] = acc2_32 / (1.0 + exp(-acc2_32));
+    }
+    if (has_oc3) {
+        let acc3_32 = f32(acc3);
+        let output_index3 = ((oc3 * output_h + oy) * output_w) + ox;
+        output_buffer.data[output_index3] = acc3_32 / (1.0 + exp(-acc3_32));
     }
 }
 "#;
